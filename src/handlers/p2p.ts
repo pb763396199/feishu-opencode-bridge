@@ -298,9 +298,10 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
 
     let totalSessionCount = 0;
     let projectOptions: Array<{ name: string; directory: string; source: 'alias' | 'history' }> = [];
+    let sessions: OpencodeSession[] = [];
     if (userConfig.enableManualSessionBind) {
       try {
-        const sessions = this.sortSessionsForCreateChat(await opencodeClient.listSessionsAcrossProjects());
+        sessions = this.sortSessionsForCreateChat(await opencodeClient.listSessionsAcrossProjects());
         totalSessionCount = sessions.length;
 
         let previousDirectory = '';
@@ -312,17 +313,17 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
           });
           previousDirectory = directory;
         }
-
-        const storeKnownDirs = chatSessionStore.getKnownDirectories();
-        const knownDirs = [...new Set([...storeKnownDirs, ...sessions.map(session => session.directory).filter(Boolean)])];
-        projectOptions = DirectoryPolicy.listAvailableProjects(knownDirs).map(project => ({
-          ...project,
-          source: project.source === 'alias' ? 'alias' : 'history',
-        }));
       } catch (error) {
         console.warn('[P2P] 加载 OpenCode 会话列表失败，建群卡片将仅显示新建选项:', error);
       }
     }
+
+    const storeKnownDirs = chatSessionStore.getKnownDirectories();
+    const knownDirs = [...new Set([...storeKnownDirs, ...sessions.map(session => session.directory).filter(Boolean)])];
+    projectOptions = DirectoryPolicy.listAvailableProjects(knownDirs).map(project => ({
+      ...project,
+      source: project.source === 'alias' ? 'alias' : 'history',
+    }));
 
     const hasSelected = sessionOptions.some(option => option.value === selectedSessionId);
     return {
