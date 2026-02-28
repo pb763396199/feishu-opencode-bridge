@@ -823,6 +823,7 @@ npm test -- tests/reliability-rescue.e2e.test.ts
 |---|---|
 | `/help` | 查看帮助 |
 | `/panel` | 打开控制面板（模型、角色、强度状态、停止、撤回） |
+| `/commands` | 生成并发送最新命令清单文件 |
 | `/model` | 查看当前模型 |
 | `/model <provider:model>` | 切换模型（支持 `provider/model`） |
 | `/effort` | 查看当前会话推理强度与当前模型可选档位 |
@@ -853,6 +854,7 @@ npm test -- tests/reliability-rescue.e2e.test.ts
 | `/clear free session <sessionId>` / `/clear_free_session <sessionId>` | 删除指定 OpenCode 会话，并移除所有本地绑定映射与该会话绑定的 Cron |
 | `/compact` | 调用 OpenCode summarize，压缩当前会话上下文 |
 | `!<shell命令>` | 透传白名单 shell 命令（如 `!ls`、`!pwd`、`!mkdir`、`!git status`） |
+| `//<命令名>` | 透传命名空间 slash 命令（如 `//superpowers:brainstorming`） |
 | `/create_chat` / `/建群` | 私聊中调出建群卡片（下拉选择后点击"创建群聊"生效） |
 | `/send <绝对路径>` | 发送指定路径的文件到当前群聊 |
 | `/restart opencode` | 重启本地 OpenCode 进程（仅 loopback） |
