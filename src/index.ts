@@ -10,6 +10,7 @@ import { groupHandler } from './handlers/group.js';
 import { lifecycleHandler } from './handlers/lifecycle.js';
 import { commandHandler } from './handlers/command.js';
 import { cardActionHandler } from './handlers/card-action.js';
+import { pendingAutoRenameSet, syncSessionTitleToChat } from './handlers/auto-rename.js';
 import { validateConfig } from './config.js';
 import {
   buildStreamCards,
@@ -1338,6 +1339,12 @@ async function main() {
     const buffer = outputBuffer.get(bufferKey);
     if (buffer && buffer.status === 'running') {
       outputBuffer.setStatus(bufferKey, 'completed');
+    }
+
+    // 自动命名同步（一次性，仅对建群时有初始 prompt 的 session）
+    if (pendingAutoRenameSet.has(sessionID)) {
+      pendingAutoRenameSet.delete(sessionID); // 先删，防止重复触发
+      void syncSessionTitleToChat(sessionID, chatId);
     }
   });
 

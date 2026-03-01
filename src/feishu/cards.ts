@@ -475,6 +475,7 @@ export interface CreateChatCardData {
   projectOptions?: Array<{ name: string; directory: string; source: 'alias' | 'history' }>;
   allowCustomPath?: boolean;
   chatNameInput?: string;  // 用户输入的群名称（用于回显）
+  initialPromptInput?: string; // 用于回显初始需求（正常为空）
 }
 
 function resolveCreateChatCardState(data: CreateChatCardData): {
@@ -517,7 +518,7 @@ function buildCreateChatSelectorElements(data: CreateChatCardData): object[] {
   }
 
   // 所有交互元素放入同一个 form 容器，确保 input 值能通过 form_value 传递
-  // 顺序：群名 → 会话来源 → 工作项目 → 自定义工作目录 → 提交按钮
+  // 顺序：群名 → 初始需求 → 会话来源 → 工作项目 → 自定义工作目录 → 提交按钮
   const formElements: object[] = [];
 
   // 1. 群名称输入框
@@ -528,7 +529,19 @@ function buildCreateChatSelectorElements(data: CreateChatCardData): object[] {
     ...(data.chatNameInput ? { default_value: data.chatNameInput } : {}),
   });
 
-  // 2. 会话来源选择器（select_static 在 form 内直接使用，不包 action 容器）
+  // 2. 初始需求输入框（可选，有内容时创建群后自动发给 AI 并命名）
+  formElements.push({
+    tag: 'input',
+    name: 'initial_prompt',
+    placeholder: {
+      tag: 'plain_text',
+      content: '输入初始需求（可选）。有内容则创建后自动发给 AI，并根据内容命名群组和会话',
+    },
+    max_length: 2000,
+    ...(data.initialPromptInput ? { default_value: data.initialPromptInput } : {}),
+  });
+
+  // 3. 会话来源选择器（select_static 在 form 内直接使用，不包 action 容器）
   formElements.push({
     tag: 'select_static',
     name: 'session_source',
@@ -540,7 +553,7 @@ function buildCreateChatSelectorElements(data: CreateChatCardData): object[] {
     })),
   });
 
-  // 3. 工作项目选择器（可选）
+  // 4. 工作项目选择器（可选）
   const projectCandidates = data.projectOptions || [];
   const projectOpts = [
     { text: { tag: 'plain_text', content: '跟随默认项目' }, value: '__default__' },
@@ -560,7 +573,7 @@ function buildCreateChatSelectorElements(data: CreateChatCardData): object[] {
     options: projectOpts,
   });
 
-  // 4. 自定义工作目录输入框（可选）
+  // 5. 自定义工作目录输入框（可选）
   if (data.allowCustomPath) {
     formElements.push({
       tag: 'input',
@@ -569,7 +582,7 @@ function buildCreateChatSelectorElements(data: CreateChatCardData): object[] {
     });
   }
 
-  // 5. 提交按钮
+  // 6. 提交按钮
   formElements.push({
     tag: 'button',
     text: { tag: 'plain_text', content: '➕ 创建群聊' },

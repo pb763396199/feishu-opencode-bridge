@@ -16,6 +16,8 @@ import { modelConfig, userConfig } from '../config.js';
 import { sendFileToFeishu } from './file-sender.js';
 import { lifecycleHandler } from './lifecycle.js';
 import { DirectoryPolicy } from '../utils/directory-policy.js';
+import { p2pHandler } from './p2p.js';
+import { CREATE_CHAT_NEW_SESSION_VALUE } from '../feishu/cards.js';
 
 const SUPPORTED_ROLE_TOOLS = [
   'bash',
@@ -846,6 +848,10 @@ export class CommandHandler {
 
         case 'rename':
           await this.handleRename(chatId, messageId, command.renameTitle);
+          break;
+
+        case 'create_chat':
+          await this.handleCreateChat(chatId, messageId, context);
           break;
 
         // 其他命令透传
@@ -2177,12 +2183,29 @@ export class CommandHandler {
              const msg = await feishuClient.sendText(chatId, '⚠️ 没有可撤回的消息');
              setTimeout(() => msg && feishuClient.deleteMessage(msg), 3000);
         }
-    } catch (error) {
-       console.error('[Undo] 执行失败:', error);
-       const msg = await feishuClient.sendText(chatId, `❌ 撤回出错: ${error}`);
-       setTimeout(() => msg && feishuClient.deleteMessage(msg), 5000);
+     } catch (error) {
+        console.error('[Undo] 执行失败:', error);
+        const msg = await feishuClient.sendText(chatId, `❌ 撤回出错: ${error}`);
+        setTimeout(() => msg && feishuClient.deleteMessage(msg), 5000);
+     }
+   }
+
+  /**
+   * 处理建群命令（私聊场景专用)
+   */
+  private async handleCreateChat(
+    chatId: string,
+    messageId: string,
+    context: { senderId: string; chatType: 'p2p' | 'group' }
+  ): Promise<void> {
+    if (context.chatType !== 'p2p') {
+      await feishuClient.reply(messageId, '❌ /create_chat 命令只能在私聊中使用');
+      return;
     }
+
+    // 调用 p2p handler 推送建群卡片
+    await p2pHandler.pushCreateChatCard(chatId, messageId, CREATE_CHAT_NEW_SESSION_VALUE, context.senderId);
   }
-}
+ }
 
 export const commandHandler = new CommandHandler();

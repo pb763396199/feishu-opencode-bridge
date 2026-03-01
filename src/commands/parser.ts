@@ -22,7 +22,8 @@ export type CommandType =
   | 'command'      // 透传命令
   | 'permission'   // 权限响应
   | 'send'         // 发送文件到飞书
-  | 'rename';      // 重命名当前会话
+  | 'rename'       // 重命名当前会话
+  | 'create_chat'; // 私聊中调出建群卡片
 
 // 解析后的命令
 export interface ParsedCommand {
@@ -412,6 +413,12 @@ export function parseCommand(text: string): ParsedCommand {
           ...(renameTitle ? { renameTitle } : {}),
         };
       }
+
+      case 'create_chat':
+      case 'create-chat':
+      case 'createchat':
+      case '建群':
+        return { type: 'create_chat' };
 
       default:
         // 未知命令透传到OpenCode（保留原始大小写）

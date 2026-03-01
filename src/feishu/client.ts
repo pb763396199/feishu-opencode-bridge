@@ -873,6 +873,25 @@ class FeishuClient extends EventEmitter {
     }
   }
 
+  // 更新群名称
+  async updateChatName(chatId: string, name: string): Promise<boolean> {
+    try {
+      const response = await this.client.im.chat.update({
+        path: { chat_id: chatId },
+        data: { name },
+      });
+      if (response.code === 0) {
+        console.log(`[飞书] 群名已更新: chatId=${chatId}, name="${name}"`);
+        return true;
+      }
+      console.warn(`[飞书] 更新群名失败: code=${response.code}, msg=${response.msg}`);
+      return false;
+    } catch (error) {
+      console.warn('[飞书] updateChatName 异常:', error);
+      return false;
+    }
+  }
+
   // 获取群成员列表 (返回 open_id 列表)
   async getChatMembers(chatId: string): Promise<string[]> {
     try {

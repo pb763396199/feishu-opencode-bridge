@@ -426,6 +426,57 @@ export class GroupHandler {
     await this.processPrompt(sessionId, text, chatId, messageId, undefined, config);
   }
 
+  /**
+   * 发送建群初始 Prompt（由 p2p.ts 在建群后调用）
+   * 复用 ensureStreamingBuffer 保证流式渲染正常
+   * @param chatId 飞书群 ID
+   * @param sessionId OpenCode session ID
+   * @param prompt 初始需求文本
+   */
+  async sendInitialPrompt(chatId: string, sessionId: string, prompt: string): Promise<void> {
+    const bufferKey = `chat:${chatId}`;
+    const sessionData = chatSessionStore.getSession(chatId);
+    let providerId: string | undefined;
+    let modelId: string | undefined;
+
+    if (modelConfig.defaultProvider && modelConfig.defaultModel) {
+      providerId = modelConfig.defaultProvider;
+      modelId = modelConfig.defaultModel;
+    }
+
+    if (sessionData?.preferredModel) {
+      const [p, m] = sessionData.preferredModel.split(':');
+      if (p && m) {
+        providerId = p;
+        modelId = m;
+      }
+    }
+
+    try {
+      this.ensureStreamingBuffer(chatId, sessionId, null);
+      await opencodeClient.sendMessagePartsAsync(
+        sessionId,
+        [{ type: 'text', text: prompt }],
+        {
+          providerId,
+          modelId,
+          agent: sessionData?.preferredAgent,
+          ...(sessionData?.preferredEffort ? { variant: sessionData.preferredEffort } : {}),
+          ...(sessionData?.resolvedDirectory ? { directory: sessionData.resolvedDirectory } : {}),
+        }
+      );
+    } catch (error) {
+      outputBuffer.setStatus(bufferKey, 'failed');
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.error('[Group] sendInitialPrompt 失败:', errorMsg);
+      try {
+        await feishuClient.sendText(chatId, `❌ 自动发送初始需求失败，请在群内重新发送\n原因: ${errorMsg}`);
+      } catch (sendErr) {
+        console.warn('[Group] 发送错误提示也失败:', sendErr);
+      }
+    }
+  }
+
   // 处理附件
   private async prepareAttachmentParts(
     messageId: string,

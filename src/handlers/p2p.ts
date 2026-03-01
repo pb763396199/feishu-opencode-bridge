@@ -13,6 +13,7 @@ import { buildSessionTimestamp } from '../utils/session-title.js';
 import { parseCommand, getHelpText, type ParsedCommand } from '../commands/parser.js';
 import { commandHandler } from './command.js';
 import { groupHandler } from './group.js';
+import { registerPendingAutoRename } from './auto-rename.js';
 import { directoryConfig, userConfig } from '../config.js';
 
 interface EnsurePrivateSessionResult {
@@ -23,6 +24,12 @@ type OpencodeSession = Awaited<ReturnType<typeof opencodeClient.listSessions>>[n
 
 const CREATE_CHAT_OPTION_LIMIT = 100;
 const CREATE_CHAT_EXISTING_LIMIT = CREATE_CHAT_OPTION_LIMIT - 1;
+
+interface CreateGroupOptions {
+  rawDirectory?: string;
+  customChatName?: string;
+  initialPrompt?: string;
+}
 
 export class P2PHandler {
   private static readonly CARD_SELECTION_TTL_MS = 10 * 60 * 1000; // 10 分钟
@@ -336,7 +343,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     };
   }
 
-  private async pushCreateChatCard(
+  public async pushCreateChatCard(
     chatId: string,
     messageId?: string,
     selectedSessionId?: string,
@@ -366,19 +373,6 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
 
   private getPrivateSessionTitle(_openId: string): string {
     return `私聊-${buildSessionTimestamp()}`;
-  }
-
-  private isCreateGroupCommand(text: string): boolean {
-    const trimmed = text.trim();
-    const lowered = trimmed.toLowerCase();
-    return (
-      lowered === '/create_chat' ||
-      lowered === '/create-chat' ||
-      lowered === '/chat new' ||
-      lowered === '/group new' ||
-      trimmed === '/建群' ||
-      trimmed === '建群'
-    );
   }
 
   private async isSessionMissingInOpenCode(sessionId: string): Promise<boolean> {
@@ -471,7 +465,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     }
 
     // 3.1 私聊专属建群快捷命令
-    if (this.isCreateGroupCommand(trimmedContent)) {
+    if (command.type === 'create_chat') {
       await this.pushCreateChatCard(chatId, messageId, CREATE_CHAT_NEW_SESSION_VALUE, senderId);
       return;
     }
@@ -542,8 +536,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     selectedSessionId: string,
     chatId?: string,
     messageId?: string,
-    rawDirectory?: string,
-    customChatName?: string
+    options?: CreateGroupOptions
   ): Promise<void> {
     const bindExistingSession = selectedSessionId !== CREATE_CHAT_NEW_SESSION_VALUE;
     if (bindExistingSession && !userConfig.enableManualSessionBind) {
@@ -552,8 +545,8 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     }
 
     let effectiveDir: string | undefined;
-    if (!bindExistingSession && rawDirectory) {
-      const dirResult = DirectoryPolicy.resolve({ explicitDirectory: rawDirectory });
+    if (!bindExistingSession && options?.rawDirectory) {
+      const dirResult = DirectoryPolicy.resolve({ explicitDirectory: options.rawDirectory });
       if (!dirResult.ok) {
         console.warn(`[P2P] 建群目录校验失败: ${dirResult.internalDetail || dirResult.code}`);
         await this.safeReply(messageId, chatId, dirResult.userMessage);
@@ -565,7 +558,11 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     console.log(`[P2P] 用户 ${openId} 请求创建新会话群，模式=${bindExistingSession ? '绑定已有会话' : '新建会话'}`);
 
     // 使用用户指定的群名，或自动生成
-    const chatName = customChatName || `会话-${Date.now().toString().slice(-6)}`;
+    const chatName = options?.customChatName || `会话-${Date.now().toString().slice(-6)}`;
+    const initialPrompt = options?.initialPrompt?.trim() || '';
+    const shouldSendPrompt = !!initialPrompt;
+    // 有 prompt 但用户已自定义群名，或绑定已有 session，不做自动命名
+    const shouldAutoRename = !!initialPrompt && !options?.customChatName && !bindExistingSession;
     const createResult = await feishuClient.createChat(chatName, [openId], '由 OpenCode 自动创建的会话群');
     if (!createResult.chatId) {
       await this.safeReply(messageId, chatId, '❌ 创建群聊失败，请重试');
@@ -633,6 +630,10 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       sessionTitle,
       { protectSessionDelete, chatType: 'group', resolvedDirectory: targetDirectory }
     );
+    // 注册自动命名（在 sendInitialPrompt 之前注册，确保时序）
+    if (shouldAutoRename) {
+      registerPendingAutoRename(targetSessionId);
+    }
     // 建群时指定的目录同时设为群默认，后续 /session new 无参数时自动继承
     if (targetDirectory) {
       chatSessionStore.updateConfig(newChatId, { defaultDirectory: targetDirectory });
@@ -653,6 +654,11 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
           '🔗 已绑定已有 OpenCode 会话，直接发送需求即可继续之前上下文。',
           '🎭 使用 /panel 选择角色，使用 /help 查看完整命令。',
         ].join('\n')
+      : shouldSendPrompt
+      ? [
+          '👋 会话已就绪，正在自动处理您的初始需求...',
+          '🎭 使用 /panel 选择角色，使用 /help 查看完整命令。',
+        ].join('\n')
       : [
           '👋 会话已就绪，直接发送需求即可开始。',
           '🎭 使用 /panel 选择角色，使用 /help 查看完整命令。',
@@ -666,6 +672,15 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       console.warn('[P2P] 发送开场控制面板失败:', error);
     }
 
+    // 有初始 prompt 时，自动发给 OpenCode
+    if (shouldSendPrompt) {
+      try {
+        await groupHandler.sendInitialPrompt(newChatId, targetSessionId, initialPrompt);
+      } catch (error) {
+        console.error('[P2P] 发送初始 prompt 失败:', error);
+        await feishuClient.sendText(newChatId, '❌ 自动发送初始需求失败，请在群内重新发送');
+      }
+    }
   }
 
   // 处理私聊中的卡片动作
@@ -791,7 +806,17 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       this.clearCreateChatProjectSelection(chatId, messageId, openId);
       this.clearCreateChatDirectoryInput(chatId, messageId, openId);
       this.clearCreateChatNameInput(chatId, messageId, openId);
-      await this.createGroupWithSessionSelection(openId, selectedSessionId, chatId, messageId, rawDirectory, customChatName);
+
+      // 读取初始 prompt（服务端兜底长度截断，与卡片 max_length: 2000 一致）
+      const initialPrompt = (formValue?.initial_prompt?.trim() || '').slice(0, 2000);
+
+      await this.createGroupWithSessionSelection(
+        openId,
+        selectedSessionId,
+        chatId,
+        messageId,
+        { rawDirectory, customChatName, initialPrompt }
+      );
       return;
     }
   }
