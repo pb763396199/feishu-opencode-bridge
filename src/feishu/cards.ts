@@ -462,6 +462,11 @@ export function buildQuestionAnsweredCardSimple(answer: string): object {
 
 export const CREATE_CHAT_NEW_SESSION_VALUE = '__new_session__';
 
+// 飞书卡片 JSON 序列化后总长度限制约 1000 字符
+// 根据实测基础卡片 JSON 约 1300 字符，需要更大余量
+// 保守设置为 1800（留 200 字符安全余量）
+const MAX_CARD_JSON_LENGTH = 1800;
+
 export interface CreateChatSessionOption {
   label: string;
   value: string;
@@ -505,16 +510,12 @@ function resolveCreateChatCardState(data: CreateChatCardData): {
 function buildCreateChatSelectorElements(data: CreateChatCardData): object[] {
   const state = resolveCreateChatCardState(data);
   const noteLines: string[] = [
-    '请先在下拉中选择会话来源，再点击“创建群聊”。',
+    '请先在下拉中选择会话来源，再点击"创建群聊"。',
     `未主动选择时默认：${state.selected.label}`,
   ];
 
   if (!data.manualBindEnabled) {
-    noteLines.push('当前环境已禁用“绑定已有会话”，仅可新建会话。');
-  }
-
-  if (state.totalSessionCount > state.shownExistingCount) {
-    noteLines.push(`已展示最近 ${state.shownExistingCount} 个会话（总计 ${state.totalSessionCount} 个）。`);
+    noteLines.push('当前环境已禁用"绑定已有会话"，仅可新建会话。');
   }
 
   // 所有交互元素放入同一个 form 容器，确保 input 值能通过 form_value 传递
@@ -535,22 +536,132 @@ function buildCreateChatSelectorElements(data: CreateChatCardData): object[] {
     name: 'initial_prompt',
     placeholder: {
       tag: 'plain_text',
-      content: '输入初始需求（可选）。有内容则创建后自动发给 AI，并根据内容命名群组和会话',
+      content: '初始需求（可选，有内容则自动发给 AI 并命名群组',
     },
-    max_length: 2000,
+    max_length: 500,
     ...(data.initialPromptInput ? { default_value: data.initialPromptInput } : {}),
   });
 
-  // 3. 会话来源选择器（select_static 在 form 内直接使用，不包 action 容器）
+  // 3. 会话来源选择器 - 根据总 JSON 长度动态截断选项列表
+  // 先添加"新建会话"选项
+  const sessionOptions = state.options;
+  const newSessionOption = sessionOptions.find(opt => opt.value === CREATE_CHAT_NEW_SESSION_VALUE);
+  const existingSessionOptions = sessionOptions.filter(opt => opt.value !== CREATE_CHAT_NEW_SESSION_VALUE);
+  
+  // 构建 select_static 的选项数组
+  const selectOptions: Array<{ text: { tag: string; content: string }; value: string }> = [];
+  if (newSessionOption) {
+    selectOptions.push({
+      text: { tag: 'plain_text', content: newSessionOption.label },
+      value: newSessionOption.value,
+    });
+  }
+
+  // 逐步添加现有会话选项，检查 JSON 长度
+  let shownExistingCount = 0;
+  for (const option of existingSessionOptions) {
+    const candidateOptions = [
+      ...selectOptions,
+      {
+        text: { tag: 'plain_text', content: option.label },
+        value: option.value,
+      },
+    ];
+
+    // 临时构建完整卡片来检查长度
+    const tempFormElements = [
+      ...formElements,
+      {
+        tag: 'select_static',
+        name: 'session_source',
+        placeholder: { tag: 'plain_text', content: '选择会话来源' },
+        value: { action: 'create_chat_select' },
+        options: candidateOptions,
+      },
+      // 4. 工作项目选择器（可选）
+      {
+        tag: 'select_static',
+        name: 'project_source',
+        placeholder: { tag: 'plain_text', content: '选择工作项目（可选）' },
+        value: { action: 'create_chat_project_select' },
+        options: [
+          { text: { tag: 'plain_text', content: '跟随默认项目' }, value: '__default__' },
+        ],
+      },
+      // 6. 提交按钮
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: '➕ 创建群聊' },
+        type: 'primary',
+        action_type: 'form_submit',
+        name: 'create_chat_submit',
+        value: {
+          action: 'create_chat_submit',
+          selectedSessionId: state.selected.value,
+        },
+      },
+    ];
+
+    const tempElements = [
+      {
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: '选择新群要绑定的会话。你可以创建全新会话，也可以绑定已有会话继续上下文。',
+        },
+      },
+      {
+        tag: 'form',
+        name: 'create_chat_form',
+        elements: tempFormElements,
+      },
+      {
+        tag: 'note',
+        elements: [
+          {
+            tag: 'plain_text',
+            content: '工作项目决定 AI 在哪份代码上工作。未选择时使用默认项目。',
+          },
+        ],
+      },
+    ];
+
+    const tempCard = {
+      config: { wide_screen_mode: true },
+      header: {
+        title: { tag: 'plain_text', content: '🧭 新建会话群' },
+        template: 'blue',
+      },
+      elements: tempElements,
+    };
+
+    const jsonLength = JSON.stringify(tempCard).length;
+    console.log(`[Cards] 检查卡片 JSON 长度: ${jsonLength}, 当前选项数: ${selectOptions.length}, 候选+1: ${candidateOptions.length}, 上限: ${MAX_CARD_JSON_LENGTH}`);
+    if (jsonLength > MAX_CARD_JSON_LENGTH) {
+      // 超过限制，停止添加
+      console.log(`[Cards] JSON 长度 ${jsonLength} > ${MAX_CARD_JSON_LENGTH}，停止添加会话选项。已添加 ${shownExistingCount} 个现有会话`);
+      break;
+    }
+
+    // 未超过限制，添加到选项列表
+    selectOptions.push({
+      text: { tag: 'plain_text', content: option.label },
+      value: option.value,
+    });
+    shownExistingCount++;
+  }
+
+  // 更新提示信息
+  if (state.totalSessionCount > shownExistingCount) {
+    noteLines.push(`已展示最近 ${shownExistingCount} 个会话（总计 ${state.totalSessionCount} 个）。`);
+  }
+
   formElements.push({
     tag: 'select_static',
     name: 'session_source',
     placeholder: { tag: 'plain_text', content: '选择会话来源' },
     value: { action: 'create_chat_select' },
-    options: state.options.map(option => ({
-      text: { tag: 'plain_text', content: option.label },
-      value: option.value,
-    })),
+    options: selectOptions,
   });
 
   // 4. 工作项目选择器（可选）

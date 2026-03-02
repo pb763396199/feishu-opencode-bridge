@@ -22,8 +22,7 @@ interface EnsurePrivateSessionResult {
 
 type OpencodeSession = Awaited<ReturnType<typeof opencodeClient.listSessions>>[number];
 
-const CREATE_CHAT_OPTION_LIMIT = 100;
-const CREATE_CHAT_EXISTING_LIMIT = CREATE_CHAT_OPTION_LIMIT - 1;
+// 卡片 JSON 长度限制在 cards.ts 中处理，这里不再限制会话数量
 
 interface CreateGroupOptions {
   rawDirectory?: string;
@@ -266,16 +265,16 @@ export class P2PHandler {
       ? session.directory.trim()
       : '/';
   }
-private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: boolean): string {
+  private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: boolean): string {
     const title = typeof session.title === 'string' && session.title.trim().length > 0
       ? session.title.trim()
-      : '未命名会话';
-    const compactTitle = title.length > 24 ? `${title.slice(0, 24)}...` : title;
+      : '未命名';
+    const compactTitle = title.length > 16 ? `${title.slice(0, 16)}...` : title; // 减少到 16
     const directory = this.getSessionDirectory(session);
-    const compactDirectory = directory.length > 18 ? `...${directory.slice(-18)}` : directory;
-    const shortId = session.id.slice(0, 8);
+    const compactDirectory = directory.length > 12 ? `...${directory.slice(-12)}` : directory; // 减少到 12
+    const shortId = session.id.slice(0, 6); // 减少到 6
     const workspaceLabel = highlightWorkspace ? `【${compactDirectory}】` : compactDirectory;
-    return `${workspaceLabel} / ${shortId} / ${compactTitle}`;
+    return `${workspaceLabel}/${shortId}/${compactTitle}`; // 移除空格
   }
 
   private sortSessionsForCreateChat(sessions: OpencodeSession[]): OpencodeSession[] {
@@ -312,7 +311,8 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
         totalSessionCount = sessions.length;
 
         let previousDirectory = '';
-        for (const session of sessions.slice(0, CREATE_CHAT_EXISTING_LIMIT)) {
+        // 不再在这里限制数量，由 cards.ts 根据总 JSON 长度动态截断
+        for (const session of sessions) {
           const directory = this.getSessionDirectory(session);
           sessionOptions.push({
             label: this.getSessionOptionLabel(session, directory !== previousDirectory),
@@ -349,13 +349,24 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     selectedSessionId?: string,
     openId?: string
   ): Promise<void> {
+    console.log(`[P2P] 开始构建建群卡片: selectedSessionId=${selectedSessionId}, openId=${openId}`);
     const cardData = await this.buildCreateChatCardData(selectedSessionId);
     const card = buildCreateChatCard(cardData);
+    console.log(`[P2P] 建群卡片构建完成，准备发送: messageId=${messageId ? '有' : '无'}`);
+    
     let sentCardMessageId: string | null = null;
-    if (messageId) {
-      sentCardMessageId = await feishuClient.replyCard(messageId, card);
-    } else {
-      sentCardMessageId = await feishuClient.sendCard(chatId, card);
+    try {
+      if (messageId) {
+        console.log(`[P2P] 使用 replyCard 发送卡片`);
+        sentCardMessageId = await feishuClient.replyCard(messageId, card);
+      } else {
+        console.log(`[P2P] 使用 sendCard 发送卡片`);
+        sentCardMessageId = await feishuClient.sendCard(chatId, card);
+      }
+      console.log(`[P2P] 卡片发送成功: sentCardMessageId=${sentCardMessageId}`);
+    } catch (error) {
+      console.error(`[P2P] 卡片发送失败:`, error);
+      throw error;
     }
 
     this.rememberCreateChatSelection(
@@ -364,6 +375,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       sentCardMessageId || messageId,
       openId
     );
+    console.log(`[P2P] 已记录建群选择: sessionId=${selectedSessionId || CREATE_CHAT_NEW_SESSION_VALUE}`);
   }
 
   private getPrivateSessionShortId(openId: string): string {
@@ -466,7 +478,14 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
 
     // 3.1 私聊专属建群快捷命令
     if (command.type === 'create_chat') {
-      await this.pushCreateChatCard(chatId, messageId, CREATE_CHAT_NEW_SESSION_VALUE, senderId);
+      console.log(`[P2P] 收到建群命令，准备推送建群卡片: chatId=${chatId}, messageId=${messageId}, senderId=${senderId}`);
+      try {
+        await this.pushCreateChatCard(chatId, messageId, CREATE_CHAT_NEW_SESSION_VALUE, senderId);
+        console.log(`[P2P] 建群卡片推送成功: chatId=${chatId}`);
+      } catch (error) {
+        console.error(`[P2P] 建群卡片推送失败:`, error);
+        await this.safeReply(messageId, chatId, `❌ 推送建群卡片失败: ${error instanceof Error ? error.message : String(error)}`);
+      }
       return;
     }
 
@@ -807,8 +826,8 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       this.clearCreateChatDirectoryInput(chatId, messageId, openId);
       this.clearCreateChatNameInput(chatId, messageId, openId);
 
-      // 读取初始 prompt（服务端兜底长度截断，与卡片 max_length: 2000 一致）
-      const initialPrompt = (formValue?.initial_prompt?.trim() || '').slice(0, 2000);
+      // 读取初始 prompt（服务端兜底长度截断，与卡片 max_length: 1000 一致）
+      const initialPrompt = (formValue?.initial_prompt?.trim() || '').slice(0, 500);
 
       await this.createGroupWithSessionSelection(
         openId,
