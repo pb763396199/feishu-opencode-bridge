@@ -899,6 +899,13 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       console.warn('[P2P] 发送任务群控制面板失败:', err);
     }
 
+    // 9. 发送普通文本欢迎消息（恢复 session-ready 体验）
+    const onboardingText = [
+      '👋 任务群已就绪，直接发送需求即可开始。',
+      '🎭 使用 /panel 选择角色，使用 /help 查看完整命令。',
+    ].join('\n');
+    await feishuClient.sendText(newChatId, onboardingText);
+
     console.log(`[P2P] 任务群创建完成: chat=${newChatId}, session=${session.id}`);
   }
 

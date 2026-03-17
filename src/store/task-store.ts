@@ -23,6 +23,7 @@ class TaskStore {
   private cache: Map<string, Task> = new Map();  // chat_id -> Task
   private cacheTimestamps: Map<string, number> = new Map();  // chat_id -> 缓存时间戳
   private lastSync: number = 0;
+  private diskCache: Set<string> | null = null;  // 懒加载的磁盘 chat_id 集合，用于 isTaskChat 回退
 
   constructor() {
     this.loadFromDisk();
@@ -54,6 +55,8 @@ class TaskStore {
         lastSync: Date.now(),
       };
       fs.writeFileSync(STORE_FILE, JSON.stringify(data, null, 2));
+      // 保存后使磁盘缓存回退失效，下次 isTaskChat 调用时重新加载
+      this.diskCache = null;
     } catch (error) {
       console.error('[TaskStore] 保存缓存失败:', error);
     }
@@ -375,10 +378,44 @@ async getTaskByChatIdFromSource(chatId: string): Promise<Task | null> {
   // ===== 辅助方法 =====
 
   /**
+   * 懒加载磁盘持久化文件中的 chat_id 集合
+   * 用于 isTaskChat 在内存缓存未命中时的回退检查
+   */
+  private loadDiskCacheIfNeeded(): Set<string> {
+    if (this.diskCache !== null) {
+      return this.diskCache;
+    }
+
+    this.diskCache = new Set<string>();
+    try {
+      if (fs.existsSync(STORE_FILE)) {
+        const content = fs.readFileSync(STORE_FILE, 'utf-8');
+        const data = JSON.parse(content) as TaskStoreData;
+        for (const chatId of Object.keys(data.tasks || {})) {
+          this.diskCache.add(chatId);
+        }
+      }
+    } catch (error) {
+      console.error('[TaskStore] 加载磁盘缓存回退失败:', error);
+      // 保持空集合，后续会重试
+    }
+    return this.diskCache;
+  }
+
+  /**
    * 检查是否为任务群
+   * 优先检查内存缓存；若未命中则回退检查磁盘持久化文件
    */
   isTaskChat(chatId: string): boolean {
-    return this.cache.has(chatId);
+    // 1. 首先检查内存缓存
+    if (this.cache.has(chatId)) {
+      return true;
+    }
+
+    // 2. 内存未命中时，回退检查磁盘持久化文件
+    // 这确保了即使内存缓存丢失（重启、TTL 过期等），已持久化的任务群仍能被识别
+    const diskCache = this.loadDiskCacheIfNeeded();
+    return diskCache.has(chatId);
   }
 
   /**
