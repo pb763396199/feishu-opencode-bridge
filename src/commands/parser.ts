@@ -32,12 +32,16 @@ export type CommandType =
   | 'restart'      // 重启服务组件
   | 'whoami'       // 查询当前用户的 open_id
   | 'workspace'    // 查看或设置工作目录（两种群都可用）
+  | 'board'        // 查看任务看板相关表链接
   // ===== 任务群专属命令 =====
   | 'task'            // 查看或设置任务内容
   | 'task_title'      // 查看或设置任务标题
+  | 'task_priority'   // 查看或设置任务优先级
   | 'task_do'         // 启动 AI 执行任务（To Do → In Progress）
   | 'task_done'       // 标记完成（需确认，仅 In Review 状态）
   | 'task_cancel'     // 取消任务
+  | 'task_archive'    // 手动归档任务
+  | 'task_archived'   // 查看已归档任务
   | 'task_followup'   // 创建续集任务
   | 'task_close'      // 解散任务群（需确认）
   | 'create_task'     // 创建任务群（弹卡片）
@@ -82,6 +86,8 @@ export interface ParsedCommand {
   taskContent?: string;
   taskTitleAction?: 'show' | 'set';
   taskTitle?: string;
+  taskPriorityAction?: 'show' | 'set';
+  taskPriorityValue?: string;
 }
 
 const BANG_SHELL_ALLOWED_COMMANDS = new Set([
@@ -447,6 +453,9 @@ export function parseCommand(text: string): ParsedCommand {
       case 'status':
         return { type: 'status' };
 
+      case 'board':
+        return { type: 'board' };
+
       case 'compact':
       case 'session.compact':
         return { type: 'compact' };
@@ -481,6 +490,12 @@ export function parseCommand(text: string): ParsedCommand {
         }
         return { type: 'task_title', taskTitleAction: 'set', taskTitle: args.join(' ') };
 
+      case 'priority':
+        if (args.length === 0) {
+          return { type: 'task_priority', taskPriorityAction: 'show' };
+        }
+        return { type: 'task_priority', taskPriorityAction: 'set', taskPriorityValue: args[0] };
+
       case 'workspace':
         // workspace 命令在两种群都可用：
         // - 无参数：显示当前工作目录
@@ -500,6 +515,12 @@ export function parseCommand(text: string): ParsedCommand {
         // 注意：原有代码中 /cancel 被映射为 stop，这里改为任务取消
         // 如果需要保留原有的 cancel -> stop 映射，需要调整
         return { type: 'task_cancel' };
+
+      case 'archive':
+        return { type: 'task_archive' };
+
+      case 'archived':
+        return { type: 'task_archived' };
 
       case 'followup':
         return { type: 'task_followup' };
@@ -528,9 +549,14 @@ export function parseCommand(text: string): ParsedCommand {
 }
 
 // 生成帮助文本
-export function getHelpText(isTaskChat: boolean = false): string {
+export function getHelpText(context: 'p2p' | 'group' | 'task' = 'group'): string {
+  const isTaskChat = context === 'task';
+  const isP2P = context === 'p2p';
   const cronHelpBlock = buildCronHelpText('feishu');
-  // 通用命令（两种群都可用）
+  const workspaceLines = isTaskChat
+    ? '• `/workspace` 查看当前任务的执行工作空间（只读，创建任务时确定）'
+    : '• `/workspace` 查看当前工作目录\n• `/workspace <路径>` 设置工作目录并新建会话';
+
   const commonCommands = `🛠️ **常用命令**
 • \`/model\` 查看当前模型
 • \`/model <名称>\` 切换模型 (e.g. \`/model gpt-4\`)
@@ -546,47 +572,76 @@ export function getHelpText(isTaskChat: boolean = false): string {
 • \`/undo\` 撤回上一轮对话 (如果你发错或 AI 答错)
 • \`/stop\` 停止当前正在生成的回答
 • \`/compact\` 压缩当前会话上下文（调用 OpenCode summarize）
-• \`/workspace\` 查看当前工作目录
-• \`/workspace <路径>\` 设置工作目录并新建会话`;
+${isP2P || isTaskChat ? '• `/board` 查看项目总表、全局任务表和当前项目任务表链接\n' : ''}
+${workspaceLines}`;
 
-  // 会话管理命令
-  const sessionCommands = `⚙️ **会话管理**
+  const sessionCommands = isTaskChat
+    ? `⚙️ **任务群会话与群状态**
+• \`/session new\` 重置当前任务群对话历史（工作目录保持不变）
+• 不支持 \`/session <sessionId>\` 切换到其他会话
+• 不支持 \`/session new <别名或路径>\` 在任务群中切换工作目录
+• \`/rename <新名称>\` 重命名当前会话
+• \`/status\` 查看当前绑定状态和群聊生命周期信息
+• \`/commands\` 生成并发送最新命令清单文件`
+    : isP2P
+      ? `⚙️ **私聊会话与建群**
 • \`/session\` 或 \`/sessions\` 列出当前项目的会话；\`/sessions all\` 列出全部项目
 • \`/session new\` 开启新话题（重置上下文）；\`/session new <别名或路径>\` 指定项目
 • \`/session new --name <名称>\` 创建时直接命名 (e.g. \`/session new --name 技术架构评审\`)
 • \`/rename <新名称>\` 随时重命名当前会话 (e.g. \`/rename Q3后端API设计讨论\`)
 • \`/session <sessionId>\` 手动绑定已有会话（需开启 \`ENABLE_MANUAL_SESSION_BIND\`）
-• \`/create_chat\` 或 \`/建群\` 私聊中调出建群卡片（新建或绑定已有会话）
+• \`/create_task\` 调出创建任务群卡片（推荐入口）
+• \`/create_chat\` 或 \`/建群\` 调出创建任务群卡片（兼容入口）
+• \`/clear\` 等价 \`/session new\`；\`/clear free session\` 清理空闲群聊
+• \`/status\` 查看当前绑定状态和群聊生命周期信息
+• \`/commands\` 生成并发送最新命令清单文件`
+      : `⚙️ **群聊会话管理**
+• \`/session\` 或 \`/sessions\` 列出当前项目的会话；\`/sessions all\` 列出全部项目
+• \`/session new\` 开启新话题（重置上下文）；\`/session new <别名或路径>\` 指定项目
+• \`/session new --name <名称>\` 创建时直接命名 (e.g. \`/session new --name 技术架构评审\`)
+• \`/rename <新名称>\` 随时重命名当前会话 (e.g. \`/rename Q3后端API设计讨论\`)
+• \`/session <sessionId>\` 手动绑定已有会话（需开启 \`ENABLE_MANUAL_SESSION_BIND\`）
 • \`/clear\` 等价 \`/session new\`；\`/clear free session\` 清理空闲群聊
 • \`/status\` 查看当前绑定状态和群聊生命周期信息
 • \`/commands\` 生成并发送最新命令清单文件`;
 
-  // 任务群专属命令
   const taskCommands = `📋 **任务群专属命令**
 • \`/task\`                查看任务内容
 • \`/task <内容>\`          设置任务内容（同时更新任务信息卡片）
 • \`/task_title\`           查看任务标题
 • \`/task_title <标题>\`    修改任务标题（同步修改群名）
+• \`/priority\`            查看任务优先级
+• \`/priority <urgent|high|medium|low>\` 设置任务优先级
 • \`/project\`             查看所属项目名称
-• \`/do\`                  启动 AI 执行任务（To Do → In Progress）
-• \`/done\`                标记任务完成（需在 In Review 状态）
-• \`/cancel\`              取消任务
-• \`/close\`               解散任务群（仅限 Done 或 Cancelled 状态）`;
+• \`/do\`                  启动 AI 执行任务（仅 To Do 可执行）
+• \`/done\`                标记任务完成（仅创建者可执行，且需在 In Review 状态）
+• \`/cancel\`              取消任务（仅创建者可执行）
+• \`/archive\`             归档当前任务（仅创建者可执行，且仅限 Done 或 Cancelled 状态）
+• \`/archived\`            查看当前项目下我创建的已归档任务
+• \`/close\`               解散任务群（仅创建者可执行，且仅限 Done 或 Cancelled 状态）`;
 
-  // 构建帮助文本
+  const introLine = isP2P
+    ? '私聊中直接发送内容，即可与 AI 对话。'
+    : '群聊中 @机器人 或回复机器人消息，即可与 AI 对话。';
+  const guideTitle = isP2P ? '私聊首次使用' : isTaskChat ? '任务群说明' : '群聊说明';
+  const guideBody = isP2P
+    ? '首次私聊会自动完成会话绑定（标题：私聊-MM-DD-HH-MM），并推送建群卡片、帮助文档和 /panel 卡片。'
+    : isTaskChat
+      ? '当前群是任务群，命令会围绕当前任务、项目与执行工作空间展开。'
+      : '当前群是普通聊天群，可进行会话控制，但不包含私聊独有的建群入口和任务群专属任务命令。';
+
   let helpText = `📖 **飞书 × OpenCode 机器人指南**
 
 💬 **如何对话**
-群聊中 @机器人 或回复机器人消息，私聊中直接发送内容，即可与 AI 对话。
+${introLine}
 
-🪄 **私聊首次使用**
-首次私聊会自动完成会话绑定（标题：私聊-MM-DD-HH-MM），并推送建群卡片、帮助文档和 /panel 卡片。
+🪄 **${guideTitle}**
+${guideBody}
 
 ${commonCommands}
 
 ${sessionCommands}`;
 
-  // 任务群额外显示任务群专属命令
   if (isTaskChat) {
     helpText += `\n\n${taskCommands}`;
   }
@@ -599,7 +654,7 @@ ${sessionCommands}`;
 • 其他未知 \`/xxx\` 命令会自动透传给 OpenCode（会话已绑定时生效）。
 • 支持 \`//xxx\` 形式透传命名空间命令（如 \`//superpowers:brainstorming\`）。
 • 支持透传白名单 shell 命令：\`!cd\`、\`!ls\`、\`!mkdir\`、\`!rm\`、\`!cp\`、\`!mv\`、\`!git\` 等；\`!vi\` / \`!vim\` / \`!nano\` 不会透传。
-• 如果遇到问题，试着使用 \`/panel\` 面板操作更方便。
+${isTaskChat ? '• 任务群创建交互遵循“先选 project，再选 execution workspace”；若项目已有专属任务表，任务会优先路由到该表。\n' : ''}${isP2P ? '• `/create_task` 是创建任务群的推荐入口；`/create_chat` 与 `/建群` 为兼容入口。\n' : ''}• 如果遇到问题，试着使用 \`/panel\` 面板操作更方便。
 
 📤 **文件发送**
 • \`/send <绝对路径>\` 直接发送文件到群聊 (e.g. \`/send /path/to/file.png\` 或 \`/send C:\\Users\\你\\Desktop\\图片.jpg\`)

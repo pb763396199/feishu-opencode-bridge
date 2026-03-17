@@ -577,7 +577,7 @@ async function main() {
     }
   }
   if (bootstrapConfig) {
-    const tasks = await taskStore.listTasks({ hidden: false });
+    const tasks = await taskStore.listTasks({ archived: false });
     console.log(`✅ 任务看板已就绪，加载 ${tasks.length} 个任务`);
   } else {
     console.warn('⚠️  任务看板初始化失败，任务相关功能不可用');
@@ -1356,6 +1356,10 @@ async function main() {
     if (typeof part.id !== 'string' || !part.id) {
       outputBuffer.append(bufferKey, part.text);
       appendTimelineText(bufferKey, `text:${sessionID}:anonymous`, 'text', part.text);
+      // 收集总结文本（与 delta 路径保持一致）
+      if (taskLifecycleHandler.isSummaryPending(sessionID)) {
+        taskLifecycleHandler.appendSummaryText(sessionID, part.text);
+      }
       return;
     }
 
@@ -1366,9 +1370,17 @@ async function main() {
       const deltaText = current.slice(prev.length);
       if (deltaText) {
         outputBuffer.append(bufferKey, deltaText);
+        // 收集总结文本（增量部分）
+        if (taskLifecycleHandler.isSummaryPending(sessionID)) {
+          taskLifecycleHandler.appendSummaryText(sessionID, deltaText);
+        }
       }
     } else if (current !== prev) {
       outputBuffer.append(bufferKey, current);
+      // 非增量替换：prev 的内容可能已被前轮收集，这里只追加净增部分避免重复
+      if (taskLifecycleHandler.isSummaryPending(sessionID) && current.length > prev.length) {
+        taskLifecycleHandler.appendSummaryText(sessionID, current.slice(prev.length));
+      }
     }
     textSnapshotMap.set(key, current);
     setTimelineText(bufferKey, `text:${key}`, 'text', current);
@@ -1918,7 +1930,7 @@ async function main() {
   // 9. 启动清理检查
   await lifecycleHandler.cleanUpOnStart();
 
-  // 10. 健康度监控定时任务
+  // 10. 任务超时提醒定时任务
   if (bootstrapConfig) {
     const HEALTH_CHECK_INTERVAL_MS = 60 * 60 * 1000;
     const IN_PROGRESS_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1926,35 +1938,29 @@ async function main() {
 
     setInterval(async () => {
       try {
-        const tasks = await taskStore.listTasks({ hidden: false });
+        const tasks = await taskStore.listTasks({ archived: false });
         const now = Date.now();
         for (const task of tasks) {
           const statusAge = now - task.status_updated_at.getTime();
 
           if (task.status === 'IN_PROGRESS' && statusAge > IN_PROGRESS_TIMEOUT_MS) {
-            if (task.health !== 'YELLOW' && task.health !== 'RED') {
-              await taskStore.updateTaskFields(task.chat_id, { health: 'YELLOW' });
-              console.log(`[健康度] 任务超时 7 天，标记 YELLOW: ${task.title}`);
-              await feishuClient.sendText(task.chat_id,
-                `⚠️ 这个任务已进行 7 天，是否还在继续？\n/done - 确认完成\n/cancel - 取消任务`
-              ).catch(console.error);
-            }
+            console.log(`[任务提醒] 任务超时 7 天: ${task.title}`);
+            await feishuClient.sendText(task.chat_id,
+              `⚠️ 这个任务已进行 7 天，是否还在继续？\n/done - 确认完成\n/cancel - 取消任务`
+            ).catch(console.error);
           } else if (task.status === 'BLOCKED' && statusAge > BLOCKED_TIMEOUT_MS) {
-            if (task.health !== 'RED') {
-              await taskStore.updateTaskFields(task.chat_id, { health: 'RED' });
-              console.log(`[健康度] 任务阻塞超 4 小时，标记 RED: ${task.title}`);
-              await feishuClient.sendText(task.chat_id,
-                `🚨 任务已阻塞超过 4 小时，请尽快处理！`
-              ).catch(console.error);
-            }
+            console.log(`[任务提醒] 任务阻塞超 4 小时: ${task.title}`);
+            await feishuClient.sendText(task.chat_id,
+              `🚨 任务已阻塞超过 4 小时，请尽快处理！`
+            ).catch(console.error);
           }
         }
       } catch (err) {
-        console.error('[健康度] 监控检查失败:', err);
+        console.error('[任务提醒] 监控检查失败:', err);
       }
     }, HEALTH_CHECK_INTERVAL_MS);
 
-    console.log('[健康度] 监控定时任务已启动（每小时检查）');
+    console.log('[任务提醒] 监控定时任务已启动（每小时检查）');
   }
 
   console.log('✅ 服务已就绪');

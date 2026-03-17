@@ -29,9 +29,13 @@ describe('ChatSessionStore - Namespaced/Legacy Compatibility', () => {
     if (fs.existsSync(TEST_STORE_FILE)) {
       fs.unlinkSync(TEST_STORE_FILE);
     }
-    // 恢复原存储文件
-    if (fs.existsSync('.chat-sessions.backup.json')) {
-      fs.renameSync('.chat-sessions.backup.json', '.chat-sessions.json');
+    // 恢复原存储文件（容忍失败，避免文件锁问题）
+    try {
+      if (fs.existsSync('.chat-sessions.backup.json')) {
+        fs.renameSync('.chat-sessions.backup.json', '.chat-sessions.json');
+      }
+    } catch {
+      // EPERM 或锁定时忽略，不影响其他测试
     }
   });
 

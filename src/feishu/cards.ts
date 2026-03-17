@@ -686,26 +686,81 @@ export function buildWelcomeCard(userName: string, createChatData?: CreateChatCa
   };
 }
 
+// 项目配置信息（用于 create_task 卡片）
+export interface ProjectOption {
+  projectId: string;
+  name: string;
+  workspacePaths: string[] | null;       // 项目配置的工作目录列表
+  defaultExecutionAgent: string | null;  // 项目默认执行Agent
+}
+
 // 创建任务卡片数据结构
 export interface CreateTaskCardData {
-  workspacePaths: string[];
+  workspacePaths: string[];    // 全局工作目录选项（向后兼容：用于无配置项目）
   projectNames: string[];
+  projects?: ProjectOption[];  // P2-A: 完整的项目配置列表
+  selectedProjectId?: string;
+  modelOptions?: Array<{ label: string; value: string }>;
+  agentOptions?: Array<{ label: string; value: string }>;
+  // P2-A: 项目选择驱动的工作空间选项映射
+  // 键为项目名称，值为该项目允许的工作目录列表
+  // 当项目有配置时，只显示该项目的工作目录；无配置时使用全局列表
+  workspacePathsByProject?: Record<string, string[]>;
 }
 
 // 构建创建任务卡片（设计文档 §10.2）
 // 飞书 form 容器内不支持 div，用 input/select_static 自带的 label 属性实现标签。
+// P2-A: 项目选择驱动工作空间和默认执行Agent
 export function buildCreateTaskCard(data: CreateTaskCardData): object {
-  // 飞书 plain_text 会将反斜杠当转义字符处理，用正斜杠显示路径（Windows 路径两者均有效）
-  const workspaceOptions = data.workspacePaths.map(p => ({
-    text: { tag: 'plain_text', content: p.replace(/\\/g, '/') },
-    value: p,  // value 保留原始路径（用于后端处理）
+  const selectedProject = data.selectedProjectId
+    ? data.projects?.find(project => project.projectId === data.selectedProjectId)
+    : undefined;
+
+  const selectedProjectWorkspaceOptions = selectedProject
+    ? (selectedProject.workspacePaths ?? []).map(path => ({
+        text: { tag: 'plain_text', content: `[${selectedProject.name}] ${path.replace(/\\/g, '/')}` },
+        value: path,
+      }))
+    : [];
+
+  const globalWorkspaceOptions = data.workspacePaths.map(path => ({
+    text: { tag: 'plain_text', content: path.replace(/\\/g, '/') },
+    value: path,
   }));
 
-  // 构建项目下拉选项
-  const projectOptions = data.projectNames.map(name => ({
-    text: { tag: 'plain_text', content: name },
-    value: name,
-  }));
+  const hasSelectedProjectWorkspaceConfig = selectedProjectWorkspaceOptions.length > 0;
+  const shouldShowProjectSelectionHint = Boolean(data.selectedProjectId) && hasSelectedProjectWorkspaceConfig;
+  const shouldWaitForProjectSelection = Boolean(data.projects?.some(project => (project.workspacePaths?.length ?? 0) > 0))
+    && !data.selectedProjectId;
+
+  const effectiveWorkspaceOptions = shouldWaitForProjectSelection
+    ? []
+    : (hasSelectedProjectWorkspaceConfig ? selectedProjectWorkspaceOptions : globalWorkspaceOptions);
+
+  // 构建项目下拉选项（包含工作空间配置提示）
+  const projectOptions = (data.projects ?? data.projectNames.map(name => ({
+    projectId: name,
+    name,
+    workspacePaths: null,
+    defaultExecutionAgent: null,
+  }))).map(project => {
+    const hasWorkspaceConfig = project.workspacePaths && project.workspacePaths.length > 0;
+    const suffix = hasWorkspaceConfig ? ` (${project.workspacePaths!.length}个执行工作空间)` : '';
+    return {
+      text: { tag: 'plain_text', content: project.name + suffix },
+      value: project.projectId,
+    };
+  });
+
+  // 构建项目工作空间映射（供前端使用）
+  const projectConfigMap: Record<string, { name: string; workspacePaths: string[]; defaultExecutionAgent: string | null }> = {};
+  for (const project of (data.projects ?? [])) {
+    projectConfigMap[project.projectId] = {
+      name: project.name,
+      workspacePaths: project.workspacePaths ?? [],
+      defaultExecutionAgent: project.defaultExecutionAgent,
+    };
+  }
 
   // form 内每个 input/select 用 label 属性携带标签，实现"标签+输入框"紧挨排列
   const formElements: object[] = [
@@ -728,14 +783,16 @@ export function buildCreateTaskCard(data: CreateTaskCardData): object {
       auto_resize: true,
     },
     // 所属项目选择（下拉框有标签，输入框无标签）
+    // P2-A: 项目是任务容器，决定任务归属和路由；工作空间是执行实例
     ...(projectOptions.length > 0 ? [{
       tag: 'select_static',
       name: 'project_select',
-      label: { tag: 'plain_text', content: '📁 所属项目（下拉选择或手动输入）' },
+      label: { tag: 'plain_text', content: '📁 所属项目（任务归属与路由单位）' },
       label_position: 'top',
-      placeholder: { tag: 'plain_text', content: '选择已有项目...' },
+      placeholder: { tag: 'plain_text', content: '选择项目以确定任务归属...' },
+      value: { action: 'create_task_project_select' },
       options: [
-        { text: { tag: 'plain_text', content: '📝 手动输入项目名' }, value: '__manual__' },
+        { text: { tag: 'plain_text', content: '📝 手动输入项目名（无预置配置）' }, value: '__manual__' },
         ...projectOptions,
       ],
     }] : []),
@@ -744,30 +801,83 @@ export function buildCreateTaskCard(data: CreateTaskCardData): object {
       name: 'project_name',
       placeholder: { tag: 'plain_text', content: '手动输入项目名称...' },
     },
-    // 工作目录选择（下拉框有标签，输入框无标签）
-    ...(workspaceOptions.length > 0 ? [{
+    // 工作空间选择（下拉框有标签，输入框无标签）
+    // P2-A: 工作空间是执行实例（worktree/branch/version），位于项目下的具体执行目录
+    ...(effectiveWorkspaceOptions.length > 0 ? [{
       tag: 'select_static',
       name: 'workspace_select',
-      label: { tag: 'plain_text', content: '📂 工作目录（下拉选择或手动输入）' },
+      label: { tag: 'plain_text', content: `📂 执行工作空间（任务运行目录）${shouldShowProjectSelectionHint ? '【已按项目筛选】' : ''}` },
       label_position: 'top',
-      placeholder: { tag: 'plain_text', content: '选择已有工作目录...' },
+      placeholder: { tag: 'plain_text', content: shouldShowProjectSelectionHint ? '选择该项目下的执行工作空间...' : '选择执行工作空间...' },
       options: [
         { text: { tag: 'plain_text', content: '📝 手动输入路径' }, value: '__manual__' },
-        ...workspaceOptions,
+        ...effectiveWorkspaceOptions,
+      ],
+    }] : []),
+    ...(shouldWaitForProjectSelection ? [{
+      tag: 'select_static',
+      name: 'workspace_select',
+      label: { tag: 'plain_text', content: '📂 执行工作空间（任务运行目录）' },
+      label_position: 'top',
+      placeholder: { tag: 'plain_text', content: '请先选择项目，再选择执行工作空间...' },
+      options: [
+        { text: { tag: 'plain_text', content: '📝 手动输入路径' }, value: '__manual__' },
       ],
     }] : []),
     {
       tag: 'input',
       name: 'workspace_path',
-      placeholder: { tag: 'plain_text', content: '手动输入工作目录路径...' },
+      placeholder: { tag: 'plain_text', content: '手动输入执行工作空间路径（代码运行目录）...' },
     },
+    ...(data.modelOptions && data.modelOptions.length > 0
+      ? [{
+          tag: 'select_static',
+          name: 'model_name',
+          label: { tag: 'plain_text', content: '🧠 模型（选填，留空则使用 OpenCode 默认）' },
+          label_position: 'top',
+          placeholder: { tag: 'plain_text', content: '选择模型（留空则使用 OpenCode 默认）' },
+          options: data.modelOptions.map(item => ({
+            text: { tag: 'plain_text', content: item.label },
+            value: item.value,
+          })),
+        }]
+      : [{
+          tag: 'input',
+          name: 'model_name',
+          label: { tag: 'plain_text', content: '🧠 模型（选填，留空则使用 OpenCode 默认）' },
+          label_position: 'top',
+          placeholder: { tag: 'plain_text', content: '例如：openai/gpt-5' },
+        }]),
+    ...(data.agentOptions && data.agentOptions.length > 0
+      ? [{
+          tag: 'select_static',
+          name: 'agent_name',
+          label: { tag: 'plain_text', content: '🤖 Agent（选填，留空则使用 OpenCode 默认）' },
+          label_position: 'top',
+          placeholder: { tag: 'plain_text', content: '选择角色（留空则使用 OpenCode 默认）' },
+          options: data.agentOptions.map(item => ({
+            text: { tag: 'plain_text', content: item.label },
+            value: item.value,
+          })),
+        }]
+      : [{
+          tag: 'input',
+          name: 'agent_name',
+          label: { tag: 'plain_text', content: '🤖 Agent（选填，留空则使用 OpenCode 默认）' },
+          label_position: 'top',
+          placeholder: { tag: 'plain_text', content: '例如：general' },
+        }]),
     {
       tag: 'button',
       text: { tag: 'plain_text', content: '创建任务' },
       type: 'primary',
       action_type: 'form_submit',
       name: 'create_task_submit',
-      value: { action: 'create_task_submit' },
+      value: {
+        action: 'create_task_submit',
+        project_config_map: JSON.stringify({ projects: projectConfigMap }),
+        selected_project_id: data.selectedProjectId ?? '',
+      },
     },
   ];
 

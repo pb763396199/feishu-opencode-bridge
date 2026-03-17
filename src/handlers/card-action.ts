@@ -11,6 +11,8 @@ import type { FeishuCardActionEvent } from '../feishu/client.js';
 import { p2pHandler } from './p2p.js';
 import { lifecycleHandler } from './lifecycle.js';
 import { taskCommandHandler } from '../commands/task-commands.js';
+import { buildCreateTaskCard } from '../feishu/cards.js';
+import { bitableClient } from '../feishu/bitable-client.js';
 
 export class CardActionHandler {
   // 防重复点击：正在处理的 action
@@ -119,6 +121,8 @@ export class CardActionHandler {
         return this.handleCloseTaskCancel(actionValue, event);
       case 'create_task_submit':
         return this.handleCreateTaskSubmit(actionValue, event);
+      case 'create_task_project_select':
+        return this.handleCreateTaskProjectSelect(actionValue, event);
       case 'create_task_cancel':
         return { toast: { type: 'info', content: '已取消创建任务' } };
       default:
@@ -522,8 +526,8 @@ export class CardActionHandler {
    */
   private async doCloseTaskAsync(chatId: string, taskId: string, taskStatus: string): Promise<void> {
     try {
-      // 1. 只标记隐藏，不改变状态
-      await taskStore.updateTaskFields(chatId, { hidden: true });
+      // 1. 标记归档，不改变状态
+      await taskStore.updateTaskFields(chatId, { archived: true, archived_at: Date.now() });
 
       // 2. 记录群解散时间
       await taskStore.updateTaskFields(chatId, { closed_at: Date.now() });
@@ -749,6 +753,26 @@ export class CardActionHandler {
     };
   }
 
+  private async handleCreateTaskProjectSelect(_value: Record<string, unknown>, event: FeishuCardActionEvent): Promise<object> {
+    const selectedProjectId = this.extractSelectedOption((event.action as Record<string, unknown>).option);
+    const chatId = event.chatId;
+
+    if (!chatId) {
+      return { toast: { type: 'error', content: '无法获取会话信息' } };
+    }
+
+    const cardData = await p2pHandler.buildCreateTaskCardData(selectedProjectId && selectedProjectId !== '__manual__' ? selectedProjectId : undefined);
+    const card = buildCreateTaskCard(cardData);
+    await this.updateActionCard(event.messageId, card, 'create_task_project_select');
+
+    return {
+      toast: {
+        type: 'success',
+        content: selectedProjectId && selectedProjectId !== '__manual__' ? '已按项目刷新工作空间' : '已切换为手动项目输入模式',
+      },
+    };
+  }
+
   private async handleCreateTaskSubmit(value: Record<string, unknown>, event: FeishuCardActionEvent): Promise<object> {
     const senderId = event.openId;
     if (!senderId) {
@@ -761,15 +785,56 @@ export class CardActionHandler {
 
     const taskTitle = (formValue.task_title ?? '').trim();
     const taskDescription = (formValue.task_description ?? '').trim() || null;
-    const projectSelect = (formValue.project_select ?? '').trim();
+    const selectedProjectIdRaw = typeof value.selected_project_id === 'string'
+      ? value.selected_project_id.trim()
+      : (formValue.selected_project_id ?? '').trim();
+    const projectSelect = ((formValue.project_select ?? '').trim() || selectedProjectIdRaw);
     const projectNameInput = (formValue.project_name ?? '').trim();
     const workspaceSelect = (formValue.workspace_select ?? '').trim();
     const workspacePathInput = (formValue.workspace_path ?? '').trim();
+    const modelNameRaw = (formValue.model_name ?? '').trim();
+    const agentNameRaw = (formValue.agent_name ?? '').trim();
+    const modelName = modelNameRaw || undefined;
+    const agentName = agentNameRaw === 'none' ? undefined : (agentNameRaw || undefined);
 
-    // 决定项目名称（下拉选择 > 手动输入）
-    const projectName = (projectSelect && projectSelect !== '__manual__')
+    // P2-A: 解析项目配置映射（如果有）
+    let projectConfigMap: { projects: Record<string, { name: string; workspacePaths: string[]; defaultExecutionAgent: string | null }> } | null = null;
+    try {
+      const configMapRaw = typeof value.project_config_map === 'string'
+        ? value.project_config_map.trim()
+        : (formValue.project_config_map ?? '').trim();
+      if (configMapRaw) {
+        projectConfigMap = JSON.parse(configMapRaw) as { projects: Record<string, { name: string; workspacePaths: string[]; defaultExecutionAgent: string | null }> };
+      }
+    } catch {
+      console.warn('[CardAction] 项目配置映射解析失败，使用默认行为');
+    }
+
+    const rawProjectSelection = (projectSelect && projectSelect !== '__manual__')
       ? projectSelect
-      : projectNameInput;
+      : undefined;
+    let selectedProjectId = rawProjectSelection && projectConfigMap?.projects?.[rawProjectSelection]
+      ? rawProjectSelection
+      : undefined;
+    let selectedProjectConfig = selectedProjectId ? projectConfigMap?.projects?.[selectedProjectId] : undefined;
+
+    if (!selectedProjectConfig && rawProjectSelection) {
+      const selectedProject = await bitableClient.findProjectById(rawProjectSelection);
+      if (selectedProject) {
+        selectedProjectId = selectedProject.project_id;
+        selectedProjectConfig = {
+          name: selectedProject.name,
+          workspacePaths: selectedProject.workspace_paths ?? [],
+          defaultExecutionAgent: selectedProject.default_execution_agent,
+        };
+      }
+    }
+
+    // 决定项目名称（手动输入 > 配置映射中的展示名 > 兼容旧卡片的下拉文本值）
+    const projectName = projectNameInput
+      || selectedProjectConfig?.name
+      || rawProjectSelection
+      || '';
 
     // 校验必填字段
     if (!taskTitle) {
@@ -779,12 +844,37 @@ export class CardActionHandler {
       return { toast: { type: 'error', content: '❌ 请从下拉列表选择项目，或手动输入项目名称' } };
     }
 
-    // 决定工作目录（下拉选择 > 手动输入）
-    const workspacePath = (workspaceSelect && workspaceSelect !== '__manual__')
-      ? workspaceSelect
-      : workspacePathInput;
+    // P2-A: 获取项目配置的工作目录和默认执行Agent
+    const projectWorkspacePaths = selectedProjectConfig?.workspacePaths ?? null;
+    // 决定工作目录（手动输入 > 下拉选择 > 项目配置的默认工作目录）
+    let workspacePath: string | undefined = workspacePathInput || undefined;
+    if (!workspacePath && workspaceSelect && workspaceSelect !== '__manual__') {
+      workspacePath = workspaceSelect;
+    }
+    
+    // P2-A: 如果未指定工作目录且项目配置了工作目录，使用第一个
+    if (!workspacePath && projectWorkspacePaths && projectWorkspacePaths.length > 0) {
+      workspacePath = projectWorkspacePaths[0];
+      console.log(`[CardAction] 使用项目 "${projectName}" 配置的默认工作目录: ${workspacePath}`);
+    }
+    
     if (!workspacePath) {
       return { toast: { type: 'error', content: '❌ 请选择或填写工作目录路径' } };
+    }
+
+    // P2-A: 如果项目配置了工作目录，验证所选工作目录是否在允许列表中
+    if (projectWorkspacePaths && projectWorkspacePaths.length > 0) {
+      const isValidWorkspace = projectWorkspacePaths.some(
+        allowedPath => workspacePath!.startsWith(allowedPath) || workspacePath === allowedPath
+      );
+      if (!isValidWorkspace) {
+        return { 
+          toast: { 
+            type: 'error', 
+            content: `❌ 工作目录 "${workspacePath}" 不在项目 "${projectName}" 允许的工作目录列表中。允许的路径: ${projectWorkspacePaths.join(', ')}` 
+          } 
+        };
+      }
     }
 
     // 异步创建任务群，不阻塞卡片响应
@@ -792,8 +882,11 @@ export class CardActionHandler {
       openId: senderId,
       taskTitle,
       taskDescription: taskDescription || null,
+      projectId: selectedProjectId,
       projectName,
       workspacePath,
+      executionAgent: agentName,
+      modelName,
     }).catch((err: unknown) => {
       console.error('[CardAction] 创建任务群失败:', err);
     });

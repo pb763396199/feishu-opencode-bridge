@@ -4,6 +4,10 @@
 import { taskStore } from '../store/task-store.js';
 import { chatSessionStore } from '../store/chat-session.js';
 import { feishuClient } from '../feishu/client.js';
+import { opencodeClient } from '../opencode/client.js';
+
+const SUMMARY_PROMPT = '请用100-200字总结本轮工作的交付内容。要求：严谨精炼，只描述实际完成的内容，不包含过程性描述或计划。格式：纯文本，不加标题和列表符号。';
+const MAX_SUMMARY_LENGTH = 1000;
 
 class TaskLifecycleHandler {
   // 防止同一 session 在短时间内重复触发 IN_PROGRESS（busy 事件可能多次触发）
@@ -14,12 +18,21 @@ class TaskLifecycleHandler {
   private reviewNotifyTimers = new Map<string, ReturnType<typeof setTimeout>>();
   // 防重入：正在处理中的 BLOCKED 转换（chatId → 锁定中）
   private blockingChats = new Set<string>();
+  // 已经发起过总结请求、等待下一次 idle 时落库的 session
+  private summaryRequestedSessions = new Set<string>();
+  // 总结文本累积缓存
+  private pendingSummaryTexts = new Map<string, string>();
 
   /**
    * OpenCode Session 首次产生工具调用时，Task → IN_PROGRESS（兜底）
    * 正常情况下 /do 命令已立刻更新为 IN_PROGRESS，此方法作为备用保障。
    */
   async onSessionFirstToolCall(sessionId: string): Promise<void> {
+    // 总结轮进行中时，busy 事件会触发此方法——不能清除总结状态，否则摘要文本无法累积
+    if (!this.summaryRequestedSessions.has(sessionId)) {
+      this.pendingSummaryTexts.delete(sessionId);
+    }
+
     // 同步检查 + 加锁（防止竞态条件）
     if (this.inProgressSessions.has(sessionId)) {
       console.log(`[TaskLifecycle] Session ${sessionId} 已处理过，跳过`);
@@ -110,6 +123,21 @@ class TaskLifecycleHandler {
     const chatId = chatSessionStore.getChatId(sessionId);
     if (!chatId) return;
 
+    if (this.summaryRequestedSessions.has(sessionId)) {
+      const summaryText = this.pendingSummaryTexts.get(sessionId) ?? '';
+      console.log(`[TaskLifecycle] 总结轮第二次 idle: session=${sessionId} summaryLen=${summaryText.length}`);
+      this.summaryRequestedSessions.delete(sessionId);
+      this.pendingSummaryTexts.delete(sessionId);
+
+      if (summaryText.trim()) {
+        console.log(`[TaskLifecycle] 总结轮结束，写入 deliverable_summary: session=${sessionId}`);
+        await taskStore.updateDeliverableSummary(chatId, summaryText);
+      } else {
+        console.log(`[TaskLifecycle] 总结轮结束，但摘要为空，跳过写入: session=${sessionId}`);
+      }
+      return;
+    }
+
     const task = await taskStore.getTaskByChatId(chatId);
     if (!task || task.status !== 'IN_PROGRESS') return;
 
@@ -123,6 +151,20 @@ class TaskLifecycleHandler {
 
     await feishuClient.updateChatName(chatId, `🟣 ${task.title}`);
     this.scheduleReviewNotify(chatId);
+    this.summaryRequestedSessions.add(sessionId);
+    console.log(`[TaskLifecycle] 已标记 summary pending: session=${sessionId}`);
+    // 使用 sendMessageAsync 而非 sendMessage：
+    // sendMessage 走同步 HTTP，AI 回复不经过 SSE 事件流，无法触发 messageUpdated + sessionIdle
+    // sendMessageAsync 走异步接口，AI 回复走 SSE，messageUpdated 会收集文本，sessionIdle 会落库
+    opencodeClient.sendMessageAsync(sessionId, SUMMARY_PROMPT)
+      .then(() => {
+        console.log(`[TaskLifecycle] summary prompt sendMessageAsync dispatched: session=${sessionId}`);
+      })
+      .catch(err => {
+        console.error('[TaskLifecycle] 发送任务完成摘要 prompt 失败:', err);
+        this.summaryRequestedSessions.delete(sessionId);
+        this.pendingSummaryTexts.delete(sessionId);
+      });
   }
 
   /**
@@ -161,6 +203,37 @@ class TaskLifecycleHandler {
       this.reviewNotifyTimers.delete(chatId);
       console.log(`[TaskLifecycle] 已取消 chatId ${chatId} 的 In Review 提醒计时`);
     }
+  }
+
+  appendSummaryText(sessionId: string, text: string): void {
+    if (!this.summaryRequestedSessions.has(sessionId) || !text) return;
+    const existing = this.pendingSummaryTexts.get(sessionId) ?? '';
+    const merged = `${existing}${text}`;
+    this.pendingSummaryTexts.set(sessionId, merged.slice(0, MAX_SUMMARY_LENGTH));
+    console.log(`[TaskLifecycle] appendSummaryText: session=${sessionId} len=${merged.length}`);
+  }
+
+  clearSummaryState(sessionId: string): void {
+    this.summaryRequestedSessions.delete(sessionId);
+    this.pendingSummaryTexts.delete(sessionId);
+  }
+
+  isSummaryPending(sessionId: string): boolean {
+    return this.summaryRequestedSessions.has(sessionId);
+  }
+
+  /** 当前正在等待总结的 session 数量（供诊断日志使用） */
+  get summaryPendingCount(): number {
+    return this.summaryRequestedSessions.size;
+  }
+
+  /** 返回所有等待总结的 sessionId 列表（供诊断日志使用） */
+  getSummaryPendingSessions(): string[] {
+    return [...this.summaryRequestedSessions];
+  }
+
+  clearBlockState(chatId: string): void {
+    this.blockingChats.delete(chatId);
   }
 
   /**
@@ -241,6 +314,7 @@ class TaskLifecycleHandler {
     this.blockingChats.delete(chatId);
     await taskStore.clearBlocked(chatId);  // 内部恢复为 IN_PROGRESS
     await feishuClient.updateChatName(chatId, `🟡 ${task.title}`);
+    await feishuClient.sendText(chatId, '▶️ 阻塞已解除，AI 继续执行...');
   }
 }
 

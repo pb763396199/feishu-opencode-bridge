@@ -14,6 +14,7 @@ import {
   BLOCKED_REASON_LABELS,
   TASK_TOPIC_LABELS,
 } from '../config/bitable-fields.js';
+import { ensureTaskTableViews } from './task-table-views.js';
 
 // ===== 状态机类型 =====
 
@@ -175,10 +176,6 @@ export class BitableBootstrap {
               property: { options: Object.values(TASK_PRIORITY_LABELS).map((name, i) => ({ name, color: i })) },
             },
             {
-              field_name: TASK_FIELDS.health, type: 3,
-              property: { options: [{ name: 'GREEN', color: 1 }, { name: 'YELLOW', color: 3 }, { name: 'RED', color: 2 }] },
-            },
-            {
               field_name: TASK_FIELDS.blocked_reason, type: 3,
               property: { options: Object.values(BLOCKED_REASON_LABELS).map((name, i) => ({ name, color: i })) },
             },
@@ -272,14 +269,12 @@ export class BitableBootstrap {
   // Task 4: 字段批量创建
   private getTaskFieldDefinitions(): Array<{ field_name: string; type: number; property?: Record<string, unknown> }> {
     return [
-      // A 组（status/priority/health/blocked_reason/title 已在建表时创建）
-      { field_name: TASK_FIELDS.assignee, type: 1 },
-      { field_name: TASK_FIELDS.topic, type: 3, property: { options: Object.values(TASK_TOPIC_LABELS).map((name, i) => ({ name, color: i })) } },
+      // A 组（status/priority/blocked_reason/title 已在建表时创建）
+      { field_name: TASK_FIELDS.execution_agent, type: 1 },
       // B 组
       { field_name: TASK_FIELDS.chat_link, type: 15 },  // 15 = URL 类型（已验证）
       { field_name: TASK_FIELDS.description, type: 1 },
       { field_name: TASK_FIELDS.workspace_path, type: 1 },
-      { field_name: TASK_FIELDS.working_branch, type: 1 },
       // C 组
       { field_name: TASK_FIELDS.started_at, type: 5 },
       { field_name: TASK_FIELDS.done_at, type: 5 },
@@ -287,29 +282,17 @@ export class BitableBootstrap {
       { field_name: TASK_FIELDS.closed_at, type: 5 },
       { field_name: TASK_FIELDS.status_updated_at, type: 5 },
       { field_name: TASK_FIELDS.unblocked_at, type: 5 },
-      { field_name: TASK_FIELDS.blocked_history, type: 1 },
-      { field_name: TASK_FIELDS.followup_task_id, type: 1 },
       { field_name: TASK_FIELDS.updated_at, type: 5 },
       // D 组
       { field_name: TASK_FIELDS.deliverable_summary, type: 1 },
-      { field_name: TASK_FIELDS.deliverable_md, type: 1 },
       // E 组
       { field_name: TASK_FIELDS.task_id, type: 1 },
       { field_name: TASK_FIELDS.project_id, type: 1 },
       { field_name: TASK_FIELDS.chat_id, type: 1 },
       { field_name: TASK_FIELDS.opencode_session_id, type: 1 },
       { field_name: TASK_FIELDS.creator_open_id, type: 1 },
-      { field_name: TASK_FIELDS.sync_last_message_id, type: 1 },
-      { field_name: TASK_FIELDS.sync_last_push_at, type: 5 },
-      { field_name: TASK_FIELDS.git_diffstat, type: 1 },
-      { field_name: TASK_FIELDS.files_changed, type: 2 },
-      { field_name: TASK_FIELDS.insertions, type: 2 },
-      { field_name: TASK_FIELDS.deletions, type: 2 },
-      { field_name: TASK_FIELDS.git_commits, type: 1 },
-      { field_name: TASK_FIELDS.git_base_commit, type: 1 },
-      { field_name: TASK_FIELDS.hidden, type: 7 },
+      { field_name: TASK_FIELDS.archived, type: 7 },
       { field_name: TASK_FIELDS.archived_at, type: 5 },
-      { field_name: TASK_FIELDS.failure_step, type: 1 },
     ];
   }
 
@@ -317,6 +300,10 @@ export class BitableBootstrap {
     return [
       { field_name: PROJECT_FIELDS.project_id, type: 1 },
       { field_name: PROJECT_FIELDS.repo_url, type: 15 },  // 15 = URL 类型（已验证）
+      // P2-A: 项目总表扩展字段（必须在 bootstrap 阶段创建，保证 health-check 能通过）
+      { field_name: PROJECT_FIELDS.task_table_id, type: 1 },           // 项目专属任务表ID
+      { field_name: PROJECT_FIELDS.default_execution_agent, type: 1 }, // 默认执行Agent
+      { field_name: PROJECT_FIELDS.workspace_paths, type: 1 },         // 工作目录配置（JSON）
       { field_name: PROJECT_FIELDS.created_at, type: 5 },
       { field_name: PROJECT_FIELDS.updated_at, type: 5 },
     ];
@@ -364,68 +351,7 @@ export class BitableBootstrap {
    * - 失败不阻断 Bootstrap 主流程
    */
   private async createTaskTableViews(appToken: string, taskTableId: string): Promise<void> {
-    try {
-      const existingViews = await bitableClient.listViews(appToken, taskTableId);
-      const hasKanban = existingViews.some(v => v.view_type === 'kanban');
-
-      // 获取所有字段（含 field_id），用于设置隐藏字段和看板分组
-      const allFields = await bitableClient.listFieldsWithId(appToken, taskTableId);
-
-      // 设置表格视图的字段可见性（隐藏 C/D/E 组中不需要日常展示的字段）
-      const gridView = existingViews.find(v => v.view_type === 'grid');
-      if (gridView) {
-        const HIDDEN_FIELD_NAMES = new Set<string>([
-          // C 组隐藏
-          TASK_FIELDS.closed_at, TASK_FIELDS.status_updated_at, TASK_FIELDS.unblocked_at,
-          TASK_FIELDS.blocked_history, TASK_FIELDS.updated_at,
-          // D 组隐藏
-          TASK_FIELDS.deliverable_md,
-          // E 组全部隐藏
-          TASK_FIELDS.task_id, TASK_FIELDS.project_id, TASK_FIELDS.chat_id,
-          TASK_FIELDS.opencode_session_id, TASK_FIELDS.creator_open_id,
-          TASK_FIELDS.sync_last_message_id, TASK_FIELDS.sync_last_push_at,
-          TASK_FIELDS.git_diffstat, TASK_FIELDS.files_changed,
-          TASK_FIELDS.insertions, TASK_FIELDS.deletions,
-          TASK_FIELDS.git_commits, TASK_FIELDS.git_base_commit,
-          TASK_FIELDS.hidden, TASK_FIELDS.archived_at, TASK_FIELDS.failure_step,
-        ]);
-        const hiddenFieldIds = allFields
-          .filter(f => HIDDEN_FIELD_NAMES.has(f.field_name))
-          .map(f => f.field_id);
-        if (hiddenFieldIds.length > 0) {
-          await bitableClient.setViewHiddenFields(appToken, taskTableId, gridView.view_id, hiddenFieldIds);
-          console.log(`[Bootstrap] 表格视图已隐藏 ${hiddenFieldIds.length} 个字段`);
-        }
-      }
-
-      if (hasKanban) {
-        console.log('[Bootstrap] 看板视图已存在，跳过');
-        return;
-      }
-
-      // 创建看板视图
-      const view = await bitableClient.createView(appToken, taskTableId, '状态看板', 'kanban');
-      if (!view) {
-        console.warn('[Bootstrap] 看板视图创建失败，可手动在飞书中添加');
-        return;
-      }
-      console.log(`[Bootstrap] 看板视图已创建: ${view.view_id}`);
-
-      // 设置看板分组依据
-      const statusField = allFields.find(f => f.field_name === TASK_FIELDS.status);
-
-      if (statusField) {
-        const ok = await bitableClient.setKanbanGroupField(appToken, taskTableId, view.view_id, statusField.field_id);
-        if (ok) {
-          console.log('[Bootstrap] 看板视图已按"状态"字段分组');
-        }
-      } else {
-        console.warn('[Bootstrap] 未找到"状态"字段，看板分组设置跳过');
-      }
-    } catch (err) {
-      // 视图创建非核心功能，失败不阻断 Bootstrap
-      console.warn('[Bootstrap] 创建视图时发生异常（非致命）:', err);
-    }
+    await ensureTaskTableViews(bitableClient, appToken, taskTableId);
   }
 
   // Task 5: healthCheck 和权限授权
@@ -441,12 +367,25 @@ export class BitableBootstrap {
       return false;
     }
 
-    const existingFields = new Set(await bitableClient.listFields(appToken, taskTableId));
+    // P2-A: 检查任务表字段
+    const existingTaskFields = new Set(await bitableClient.listFields(appToken, taskTableId));
     const allTaskFieldNames = Object.values(TASK_FIELDS);
-    const missingFields = allTaskFieldNames.filter(f => !existingFields.has(f));
+    const missingTaskFields = allTaskFieldNames.filter(f => !existingTaskFields.has(f));
 
-    if (missingFields.length > 0) {
-      console.log(`[Bootstrap] 发现 ${missingFields.length} 个缺失字段，自动补创...`);
+    if (missingTaskFields.length > 0) {
+      console.log(`[Bootstrap] 任务表发现 ${missingTaskFields.length} 个缺失字段，自动补创...`);
+      this.state = { ...this.state, created_fields: [] };
+      await this.createRemainingFields(appToken, taskTableId, projectTableId);
+    }
+
+    // P2-A: 检查项目表字段（必须包含 P2 扩展字段）
+    const existingProjectFields = new Set(await bitableClient.listFields(appToken, projectTableId));
+    const allProjectFieldNames = Object.values(PROJECT_FIELDS);
+    const missingProjectFields = allProjectFieldNames.filter(f => !existingProjectFields.has(f));
+
+    if (missingProjectFields.length > 0) {
+      console.log(`[Bootstrap] 项目表发现 ${missingProjectFields.length} 个缺失字段，自动补创...`);
+      console.log(`[Bootstrap] 缺失字段: ${missingProjectFields.join(', ')}`);
       this.state = { ...this.state, created_fields: [] };
       await this.createRemainingFields(appToken, taskTableId, projectTableId);
     }

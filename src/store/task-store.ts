@@ -60,16 +60,24 @@ class TaskStore {
   }
 
   private deserializeTask(raw: Task): Task {
+    const legacy = raw as unknown as {
+      assignee?: string;
+      hidden?: boolean;
+      archived?: boolean;
+      archived_at?: Date | string | number | null;
+    };
+
     return {
       ...raw,
+      execution_agent: raw.execution_agent ?? legacy.assignee ?? 'default',
       created_at: new Date(raw.created_at),
       started_at: raw.started_at ? new Date(raw.started_at) : null,
       done_at: raw.done_at ? new Date(raw.done_at) : null,
       closed_at: raw.closed_at ? new Date(raw.closed_at) : null,
       status_updated_at: new Date(raw.status_updated_at),
       unblocked_at: raw.unblocked_at ? new Date(raw.unblocked_at) : null,
-      sync_last_push_at: raw.sync_last_push_at ? new Date(raw.sync_last_push_at) : null,
-      archived_at: raw.archived_at ? new Date(raw.archived_at) : null,
+      archived: raw.archived ?? legacy.hidden ?? false,
+      archived_at: (raw.archived_at ?? legacy.archived_at) ? new Date((raw.archived_at ?? legacy.archived_at) as string | number | Date) : null,
       updated_at: new Date(raw.updated_at),
     };
   }
@@ -164,35 +172,20 @@ async getTaskByChatIdFromSource(chatId: string): Promise<Task | null> {
       creator_open_id: input.creator_open_id,
       status: 'TODO',
       priority: 'medium',
-      health: 'GREEN',
       blocked_reason: null,
-      assignee: input.creator_open_id,
-      topic: null,
+      execution_agent: 'default',
       chat_link: '',
-      working_branch: null,
       started_at: null,
       done_at: null,
       created_at: now,
       closed_at: null,
       status_updated_at: now,
       unblocked_at: null,
-      blocked_history: null,
-      followup_task_id: null,
       updated_at: now,
       deliverable_summary: null,
-      deliverable_md: null,
       project_id: null,
-      sync_last_message_id: null,
-      sync_last_push_at: null,
-      git_diffstat: null,
-      files_changed: null,
-      insertions: null,
-      deletions: null,
-      git_commits: null,
-      git_base_commit: null,
-      hidden: false,
+      archived: false,
       archived_at: null,
-      failure_step: null,
     };
     this.updateCache(chatId, placeholder);
     this.saveToDisk();
@@ -246,7 +239,6 @@ async getTaskByChatIdFromSource(chatId: string): Promise<Task | null> {
     if (success) {
       task.status = 'BLOCKED';
       task.blocked_reason = reason;
-      task.health = 'RED';
       task.status_updated_at = new Date();
       this.updateCache(chatId, task);
       this.saveToDisk();
@@ -272,7 +264,6 @@ async getTaskByChatIdFromSource(chatId: string): Promise<Task | null> {
     if (success) {
       task.status = 'IN_PROGRESS';
       task.blocked_reason = null;
-      task.health = 'GREEN';
       task.unblocked_at = new Date();
       task.status_updated_at = new Date();
       this.updateCache(chatId, task);
@@ -300,18 +291,36 @@ async getTaskByChatIdFromSource(chatId: string): Promise<Task | null> {
   }
 
   /**
+   * 更新任务完成摘要
+   */
+  async updateDeliverableSummary(chatId: string, summary: string): Promise<boolean> {
+    const task = await this.getTaskByChatId(chatId);
+    if (!task) return false;
+
+    const trimmed = summary.trim();
+    if (!trimmed) return false;
+
+    const success = await bitableClient.updateTaskFields(task.task_id, {
+      deliverable_summary: trimmed,
+    });
+    if (success) {
+      task.deliverable_summary = trimmed;
+      task.updated_at = new Date();
+      this.updateCache(chatId, task);
+      this.saveToDisk();
+    }
+    return success;
+  }
+
+  /**
    * 标记任务取消
    */
   async markCancelled(chatId: string): Promise<boolean> {
     const task = await this.getTaskByChatId(chatId);
     if (!task) return false;
 
-    const success = await bitableClient.updateTaskFields(task.task_id, {
-      hidden: true,
-    });
+    const success = true;
     if (success) {
-      task.hidden = true;  // 同步更新缓存
-      this.updateCache(chatId, task);
       await this.updateTaskStatus(chatId, 'CANCELLED');
     }
     return success;
@@ -335,13 +344,12 @@ async getTaskByChatIdFromSource(chatId: string): Promise<Task | null> {
         else if (key === 'description') task.description = value as string | null;
         else if (key === 'status') task.status = value as TaskStatus;
         else if (key === 'priority') task.priority = value as TaskPriority;
-        else if (key === 'health') task.health = value as 'GREEN' | 'YELLOW' | 'RED';
-        else if (key === 'assignee') task.assignee = value as string;
+        else if (key === 'execution_agent') task.execution_agent = value as string;
         else if (key === 'project_id') task.project_id = value as string | null;
-        else if (key === 'hidden') task.hidden = value as boolean;
+        else if (key === 'archived') task.archived = value as boolean;
+        else if (key === 'archived_at') task.archived_at = value ? new Date(value as number | string) : null;
         else if (key === 'opencode_session_id') task.opencode_session_id = value as string;
-        else if (key === 'working_branch') task.working_branch = value as string | null;
-        else if (key === 'followup_task_id') task.followup_task_id = value as string | null;
+        else if (key === 'deliverable_summary') task.deliverable_summary = value as string | null;
         // 其他字段按需添加
       }
       task.updated_at = new Date();

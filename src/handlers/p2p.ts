@@ -9,6 +9,7 @@ import {
   buildCreateTaskCard,
   CREATE_CHAT_NEW_SESSION_VALUE,
   type CreateChatCardData,
+  type CreateTaskCardData,
   type CreateChatSessionOption,
 } from '../feishu/cards.js';
 import { DirectoryPolicy } from '../utils/directory-policy.js';
@@ -364,17 +365,64 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
   }
 
   private async pushCreateTaskCard(chatId: string, messageId?: string, openId?: string): Promise<void> {
-    // 与 create_chat 保持一致：用 DirectoryPolicy.listAvailableProjects 合并别名+历史路径
+    const cardData = await this.buildCreateTaskCardData();
+    const card = buildCreateTaskCard(cardData);
+    await feishuClient.sendCard(chatId, card);
+  }
+
+  async buildCreateTaskCardData(selectedProjectId?: string): Promise<CreateTaskCardData> {
+    // 与 create_chat 保持一致：合并 store 历史路径 + OpenCode 活跃 sessions 目录 + 别名
     const storeKnownDirs = chatSessionStore.getKnownDirectories();
-    const projectOptions = DirectoryPolicy.listAvailableProjects(storeKnownDirs);
+    let sessionDirs: string[] = [];
+    try {
+      const sessions = await opencodeClient.listSessionsAcrossProjects();
+      sessionDirs = sessions.map(s => s.directory).filter((d): d is string => typeof d === 'string' && d.trim().length > 0);
+    } catch (error) {
+      console.warn('[P2P] 加载 OpenCode 会话目录列表失败，仅使用本地历史路径:', error);
+    }
+    const knownDirs = [...new Set([...storeKnownDirs, ...sessionDirs])];
+    const projectOptions = DirectoryPolicy.listAvailableProjects(knownDirs);
     const workspacePaths = projectOptions.map(p => p.directory);
     
-    // 获取所有项目列表用于下拉选择
+    // P2-A: 获取所有项目列表（含配置信息）用于下拉选择和配置驱动
     const projects = await bitableClient.listAllProjects();
     const projectNames = projects.map(p => p.name);
     
-    const card = buildCreateTaskCard({ workspacePaths, projectNames });
-    await feishuClient.sendCard(chatId, card);
+    // P2-A: 构建完整的项目配置列表
+    const projectConfigs = projects.map(p => ({
+      projectId: p.project_id,
+      name: p.name,
+      workspacePaths: p.workspace_paths,
+      defaultExecutionAgent: p.default_execution_agent,
+    }));
+
+    // P2-A: 构建项目到工作空间的映射，用于卡片中显示项目下的执行工作空间
+    const workspacePathsByProject: Record<string, string[]> = {};
+    for (const project of projects) {
+      if (project.workspace_paths && project.workspace_paths.length > 0) {
+        workspacePathsByProject[project.project_id] = project.workspace_paths;
+      }
+    }
+
+    let modelOptions: Array<{ label: string; value: string }> = [];
+    let agentOptions: Array<{ label: string; value: string }> = [];
+    try {
+      const panelSelections = await commandHandler.getPanelSelectionOptions();
+      modelOptions = panelSelections.modelOptions;
+      agentOptions = panelSelections.agentOptions;
+    } catch (error) {
+      console.warn('[P2P] 加载 create_task 的模型/角色候选项失败，回退到文本输入:', error);
+    }
+
+    return {
+      workspacePaths,
+      projectNames,
+      projects: projectConfigs,
+      workspacePathsByProject,
+      selectedProjectId,
+      modelOptions,
+      agentOptions,
+    };
   }
 
   private getPrivateSessionShortId(openId: string): string {
@@ -457,7 +505,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       welcomeCardMessageId || undefined,
       senderId
     );
-    await this.safeReply(messageId, chatId, getHelpText());
+    await this.safeReply(messageId, chatId, getHelpText('p2p'));
 
     try {
       await commandHandler.pushPanelCard(chatId, 'p2p');
@@ -474,7 +522,13 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     // 1. 检查命令
     const command = parseCommand(content);
 
-    // 2. 首次私聊（或绑定会话在 OpenCode 中已被删除）时，自动初始化并推送引导
+    // 2. /create_task 仅需弹卡片，不应被私聊会话初始化前置依赖阻断
+    if (command.type === 'create_task') {
+      await this.pushCreateTaskCard(chatId, messageId, senderId);
+      return;
+    }
+
+    // 3. 首次私聊（或绑定会话在 OpenCode 中已被删除）时，自动初始化并推送引导
     const ensured = await this.ensurePrivateSession(chatId, senderId);
     if (!ensured) {
       await this.safeReply(messageId, chatId, '❌ 初始化私聊会话失败，请稍后重试');
@@ -491,12 +545,6 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     // 3.1 私聊专属建群快捷命令
     if (this.isCreateGroupCommand(trimmedContent)) {
       await this.pushCreateChatCard(chatId, messageId, CREATE_CHAT_NEW_SESSION_VALUE, senderId);
-      return;
-    }
-
-    // 3.2 /create_task：弹出创建任务卡片
-    if (command.type === 'create_task') {
-      await this.pushCreateTaskCard(chatId, messageId, senderId);
       return;
     }
 
@@ -728,15 +776,19 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
 
   /**
    * 创建任务群完整流程（设计文档 §10.3）
+   * P2-A: 支持项目配置驱动的工作空间和执行Agent
    */
   async createTaskGroup(params: {
     openId: string;
     taskTitle: string;
     taskDescription: string | null;
+    projectId?: string;
     projectName: string;
     workspacePath: string;
+    executionAgent?: string;  // P2-A: 项目配置的默认执行Agent
+    modelName?: string;       // P3-A: 显式指定模型（留空则使用 OpenCode 默认）
   }): Promise<void> {
-    const { openId, taskTitle, taskDescription, projectName, workspacePath } = params;
+    const { openId, taskTitle, taskDescription, projectId, projectName, workspacePath, executionAgent, modelName } = params;
     console.log(`[P2P] 创建任务群: title="${taskTitle}", project="${projectName}", path="${workspacePath}"`);
 
     // 1. 校验工作目录
@@ -780,8 +832,12 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       chatType: 'group',
       resolvedDirectory: session.directory,
     });
-    if (session.directory) {
-      chatSessionStore.updateConfig(newChatId, { defaultDirectory: session.directory });
+    if (session.directory || modelName || executionAgent) {
+      chatSessionStore.updateConfig(newChatId, {
+        defaultDirectory: session.directory,
+        preferredModel: modelName || undefined,
+        preferredAgent: executionAgent || undefined,
+      });
     }
     console.log(`[P2P] 已绑定 Session: Chat=${newChatId}, Session=${session.id}`);
 
@@ -791,6 +847,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       description: taskDescription ?? undefined,
       workspace_path: session.directory || workspacePath,
       creator_open_id: openId,
+      project_id: projectId,
       project_name: projectName,
     }, session.id);
 
@@ -803,7 +860,9 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
         description: taskDescription ?? undefined,
         workspace_path: session.directory || workspacePath,
         creator_open_id: openId,
+        project_id: projectId,
         project_name: projectName,
+        execution_agent: executionAgent,  // P2-A: 传递项目配置的默认执行Agent
       },
       session.id,
       newChatId,

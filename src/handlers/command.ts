@@ -23,6 +23,7 @@ import { getRuntimeCronManager } from '../reliability/runtime-cron-registry.js';
 import { formatRestartResultText, restartOpenCodeProcess } from '../reliability/opencode-restart.js';
 import { parseCronIntentWithOpenCode } from '../reliability/cron-semantic.js';
 import { cleanupRuntimeCronJobsBySessionId, scanAndCleanupOrphanRuntimeCronJobs } from '../reliability/runtime-cron-orphan.js';
+import { bitableClient } from '../feishu/bitable-client.js';
 
 const SUPPORTED_ROLE_TOOLS = [
   'bash',
@@ -744,11 +745,18 @@ export class CommandHandler {
     try {
       switch (command.type) {
         case 'help':
-          await feishuClient.reply(messageId, getHelpText(taskStore.isTaskChat(chatId)));
+          await feishuClient.reply(
+            messageId,
+            getHelpText(taskStore.isTaskChat(chatId) ? 'task' : context.chatType)
+          );
           break;
 
         case 'status':
           await this.handleStatus(chatId, messageId);
+          break;
+
+        case 'board':
+          await this.handleBoard(chatId, messageId, context.chatType);
           break;
 
         case 'session':
@@ -896,6 +904,12 @@ export class CommandHandler {
           break;
         }
 
+        case 'task_priority': {
+          const priorityCmdType = command.taskPriorityAction === 'set' ? 'priority_set' : 'priority_show';
+          await this.handleTaskCommand(chatId, messageId, context.senderId, priorityCmdType, command.taskPriorityValue);
+          break;
+        }
+
         case 'task_do':
           await this.handleTaskCommand(chatId, messageId, context.senderId, 'do');
           break;
@@ -906,6 +920,14 @@ export class CommandHandler {
 
         case 'task_cancel':
           await this.handleTaskCommand(chatId, messageId, context.senderId, 'cancel');
+          break;
+
+        case 'task_archive':
+          await this.handleTaskCommand(chatId, messageId, context.senderId, 'archive');
+          break;
+
+        case 'task_archived':
+          await this.handleTaskCommand(chatId, messageId, context.senderId, 'archived_show');
           break;
 
         case 'task_followup':
@@ -1066,6 +1088,48 @@ export class CommandHandler {
     }
 
     await feishuClient.reply(messageId, `🤖 **OpenCode 状态**\n\n${status}\n${extra}`);
+  }
+
+  private buildBitableTableUrl(appToken: string, tableId: string): string {
+    return `https://feishu.cn/base/${appToken}?table=${tableId}`;
+  }
+
+  private async handleBoard(chatId: string, messageId: string, chatType: 'p2p' | 'group'): Promise<void> {
+    const isTaskChat = taskStore.isTaskChat(chatId);
+    if (!isTaskChat && chatType !== 'p2p') {
+      await feishuClient.reply(messageId, '❌ 当前群不是任务群，无法执行任务命令');
+      return;
+    }
+
+    const config = bitableClient.getConfig();
+    if (!config) {
+      await feishuClient.reply(messageId, '❌ Bitable 未配置，无法获取看板链接');
+      return;
+    }
+
+    const lines = [
+      '📊 **任务看板入口**',
+      '',
+      `• 项目总表：${this.buildBitableTableUrl(config.appToken, config.projectTableId)}`,
+      `• 全局任务表：${this.buildBitableTableUrl(config.appToken, config.taskTableId)}`,
+    ];
+
+    if (isTaskChat) {
+      const task = await taskStore.getTaskByChatId(chatId);
+      if (!task) {
+        await feishuClient.reply(messageId, '❌ 未找到任务信息');
+        return;
+      }
+
+      if (task.project_id) {
+        const project = await bitableClient.findProjectById(task.project_id);
+        if (project?.task_table_id) {
+          lines.push(`• 当前项目任务表：${this.buildBitableTableUrl(config.appToken, project.task_table_id)}`);
+        }
+      }
+    }
+
+    await feishuClient.reply(messageId, lines.join('\n'));
   }
 
   /**
@@ -1260,8 +1324,8 @@ export class CommandHandler {
     // 检查是否是任务群
     const task = await taskStore.getTaskByChatId(chatId);
     if (task) {
-      // 任务群：显示任务的工作目录
-      await feishuClient.reply(messageId, `📂 **工作目录**: ${task.workspace_path}\n\n（只读，创建任务时确定）`);
+      // 任务群：显示任务的执行工作空间
+      await feishuClient.reply(messageId, `📂 **执行工作空间**: ${task.workspace_path}\n\n（只读，创建任务时确定）`);
       return;
     }
 
@@ -1838,6 +1902,78 @@ export class CommandHandler {
     return '默认角色';
   }
 
+  private buildPanelModelOptions(
+    providers: Awaited<ReturnType<typeof opencodeClient.getProviders>>['providers'],
+  ): Array<{ label: string; value: string }> {
+    const modelOptions: Array<{ label: string; value: string }> = [];
+    const modelOptionValues = new Set<string>();
+    const safeProviders = Array.isArray(providers) ? providers : [];
+
+    for (const p of safeProviders) {
+      const modelsRaw = (p as unknown as Record<string, unknown>).models;
+      const models = Array.isArray(modelsRaw)
+        ? modelsRaw
+        : (modelsRaw && typeof modelsRaw === 'object' ? Object.values(modelsRaw) : []);
+
+      for (const m of models) {
+        const modelRecord = m as Record<string, unknown>;
+        const providerRecord = p as unknown as Record<string, unknown>;
+        const modelId = typeof modelRecord.id === 'string'
+          ? modelRecord.id
+          : (typeof modelRecord.modelID === 'string' ? modelRecord.modelID : modelRecord.name as string | undefined);
+        const modelName = typeof modelRecord.name === 'string' ? modelRecord.name : modelId;
+        const providerId = typeof providerRecord.id === 'string'
+          ? providerRecord.id
+          : providerRecord.providerID as string | undefined;
+        const providerName = typeof providerRecord.name === 'string' ? providerRecord.name : providerId;
+
+        if (modelId && providerId) {
+          const label = `[${providerName || providerId}] ${modelName}`;
+          const value = `${providerId}:${modelId}`;
+          if (!modelOptionValues.has(value)) {
+            modelOptionValues.add(value);
+            modelOptions.push({ label, value });
+          }
+        }
+      }
+    }
+
+    return modelOptions;
+  }
+
+  private buildPanelAgentOptions(
+    allAgents: OpencodeAgentInfo[],
+    runtimeConfig: OpencodeRuntimeConfig,
+  ): Array<{ label: string; value: string }> {
+    const visibleAgents = this.getVisibleAgents(allAgents);
+    const defaultAgentName = this.getRuntimeDefaultAgentName(runtimeConfig);
+    const hideDefaultRoleOption = this.shouldHideDefaultRoleOption(defaultAgentName, visibleAgents);
+    const mappedAgentOptions = visibleAgents.map(agent => ({
+      label: this.getAgentDisplayText(agent),
+      value: agent.name,
+    }));
+
+    return hideDefaultRoleOption
+      ? mappedAgentOptions
+      : [{ label: '（主）默认角色', value: 'none' }, ...mappedAgentOptions];
+  }
+
+  public async getPanelSelectionOptions(): Promise<{
+    modelOptions: Array<{ label: string; value: string }>;
+    agentOptions: Array<{ label: string; value: string }>;
+  }> {
+    const [{ providers }, allAgents, runtimeConfig] = await Promise.all([
+      opencodeClient.getProviders(),
+      opencodeClient.getAgents(),
+      opencodeClient.getConfig(),
+    ]);
+
+    return {
+      modelOptions: this.buildPanelModelOptions(providers).slice(0, PANEL_MODEL_OPTION_LIMIT),
+      agentOptions: this.buildPanelAgentOptions(allAgents, runtimeConfig),
+    };
+  }
+
   private getRoleAgentMap(config: OpencodeRuntimeConfig): Record<string, OpencodeAgentConfig> {
     if (!config.agent || typeof config.agent !== 'object') {
       return {};
@@ -1992,32 +2128,7 @@ export class CommandHandler {
       ? this.getCurrentRoleDisplay(session.preferredAgent, visibleAgents)
       : this.getDefaultRoleDisplay(defaultAgentName, visibleAgents);
 
-    const modelOptions: { label: string; value: string }[] = [];
-    const modelOptionValues = new Set<string>();
-    const safeProviders = Array.isArray(providers) ? providers : [];
-
-    for (const p of safeProviders) {
-      // 安全获取 models，兼容数组和对象
-      const modelsRaw = (p as any).models;
-      const models = Array.isArray(modelsRaw)
-        ? modelsRaw
-        : (modelsRaw && typeof modelsRaw === 'object' ? Object.values(modelsRaw) : []);
-
-      for (const m of models) {
-        const modelId = (m as any).id || (m as any).modelID || (m as any).name;
-        const modelName = (m as any).name || modelId;
-        const providerId = (p as any).id || (p as any).providerID;
-
-        if (modelId && providerId) {
-          const label = `[${p.name || providerId}] ${modelName}`;
-          const value = `${providerId}:${modelId}`;
-          if (!modelOptionValues.has(value)) {
-            modelOptionValues.add(value);
-            modelOptions.push({ label, value });
-          }
-        }
-      }
-    }
+    const modelOptions = this.buildPanelModelOptions(providers);
 
     const selectedModel = session?.preferredModel || '';
     let panelModelOptions = modelOptions.slice(0, PANEL_MODEL_OPTION_LIMIT);
@@ -2032,14 +2143,7 @@ export class CommandHandler {
       }
     }
 
-    const mappedAgentOptions = visibleAgents.map(agent => ({
-      label: this.getAgentDisplayText(agent),
-      value: agent.name,
-    }));
-
-    const agentOptions = hideDefaultRoleOption
-      ? mappedAgentOptions
-      : [{ label: '（主）默认角色', value: 'none' }, ...mappedAgentOptions];
+    const agentOptions = this.buildPanelAgentOptions(allAgents, runtimeConfig);
 
     return buildControlCard({
       conversationKey: `chat:${chatId}`,

@@ -694,6 +694,11 @@ export class OpenCodeEventHub {
             appendTimelineText(bufferKey, `text:${sessionID}:anonymous`, 'text', delta);
           }
           outputBuffer.append(bufferKey, delta);
+          if (taskLifecycleHandler.isSummaryPending(sessionID)) {
+            taskLifecycleHandler.appendSummaryText(sessionID, delta);
+          } else if (taskLifecycleHandler.summaryPendingCount > 0) {
+            console.log(`[EventHub] text delta but isSummaryPending=false, sessionID=${sessionID}, pendingSessions=${JSON.stringify(taskLifecycleHandler.getSummaryPendingSessions())}`);
+          }
           return;
         }
         outputBuffer.append(bufferKey, delta);
@@ -745,6 +750,9 @@ export class OpenCodeEventHub {
         } else {
           appendTimelineText(bufferKey, `text:${sessionID}:anonymous`, 'text', deltaObj.text);
         }
+        if (taskLifecycleHandler.isSummaryPending(sessionID)) {
+          taskLifecycleHandler.appendSummaryText(sessionID, deltaObj.text);
+        }
       } else if (typeof deltaObj.text === 'string' && deltaObj.text.length > 0) {
         outputBuffer.append(bufferKey, deltaObj.text);
         if (part?.type === 'reasoning') {
@@ -766,6 +774,9 @@ export class OpenCodeEventHub {
             setTimelineText(bufferKey, `text:${key}`, 'text', next);
           } else {
             appendTimelineText(bufferKey, `text:${sessionID}:anonymous`, 'text', deltaObj.text);
+          }
+          if (taskLifecycleHandler.isSummaryPending(sessionID)) {
+            taskLifecycleHandler.appendSummaryText(sessionID, deltaObj.text);
           }
         }
       }

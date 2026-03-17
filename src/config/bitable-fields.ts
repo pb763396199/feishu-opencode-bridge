@@ -13,15 +13,20 @@
  *   1 - 初始版本（v2.3，31个任务字段 + 5个项目字段）
  *   2 - v3.0：删除 INBOX/BACKLOG，新增 IN_REVIEW（错误：状态标签使用英文）
  *   3 - v3.0修正：状态标签改回中文（待执行/进行中/被阻塞/待验收/已完成/已取消）
+ *   4 - P1 收口：删除 health，assignee 重命名为 execution_agent，hidden 重命名为 archived
+ *   5 - P2：项目总表扩展字段，支持每项目独立任务表
  */
-export const BITABLE_SCHEMA_VERSION = '3';
+export const BITABLE_SCHEMA_VERSION = '5';
 
 export const PROJECT_FIELDS = {
-  project_id:  '项目ID',
-  name:        '项目名称',
-  repo_url:    '仓库地址',
-  created_at:  '创建时间',
-  updated_at:  '更新时间',
+  project_id:              '项目ID',
+  name:                    '项目名称',
+  repo_url:                '仓库地址',
+  task_table_id:           '任务表ID',           // P2: 该项目专属任务表的 table_id
+  default_execution_agent: '默认执行Agent',       // P2: 该项目任务的默认执行 Agent
+  workspace_paths:         '工作目录配置',       // P2: 该项目可用的工作目录（JSON）
+  created_at:              '创建时间',
+  updated_at:              '更新时间',
 } as const;
 
 export const TASK_FIELDS = {
@@ -29,15 +34,12 @@ export const TASK_FIELDS = {
   title:           '任务名称',
   status:          '状态',
   priority:        '优先级',
-  health:          '健康度',
   blocked_reason:  '阻塞原因',
-  assignee:        '负责人',
-  topic:           '任务分类',
+  execution_agent: '执行Agent',
   // B. 行动与跳转
   chat_link:       '群聊链接',
   description:     '任务内容',
   workspace_path:  '工作目录',
-  working_branch:  '工作分支',
   // C. 时间与节奏
   started_at:         '开始时间',
   done_at:            '完成时间',
@@ -45,29 +47,17 @@ export const TASK_FIELDS = {
   closed_at:          '群解散时间',
   status_updated_at:  '状态更新时间',
   unblocked_at:       '解除阻塞时间',
-  blocked_history:    '历史阻塞记录',
-  followup_task_id:   '续集任务ID',
   updated_at:         '更新时间',
   // D. 交付物
   deliverable_summary: '交付摘要',
-  deliverable_md:      '交付详情',
   // E. 系统与快照（隐藏）
   task_id:               '任务ID',
   project_id:            '项目ID',
   chat_id:               '群组ID',
   opencode_session_id:   '会话ID',
   creator_open_id:       '创建者ID',
-  sync_last_message_id:  '最后同步消息',
-  sync_last_push_at:     '最后推送时间',
-  git_diffstat:          '变更统计',
-  files_changed:         '变更文件数',
-  insertions:            '新增行数',
-  deletions:             '删除行数',
-  git_commits:           '提交记录',
-  git_base_commit:       'Git基线提交',
-  hidden:                '是否隐藏',
+  archived:              '是否归档',
   archived_at:           '归档时间',
-  failure_step:          '创建失败步骤',
 } as const;
 
 export const TASK_STATUS_LABELS = {

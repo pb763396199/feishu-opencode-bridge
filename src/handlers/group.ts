@@ -142,8 +142,12 @@ export class GroupHandler {
     const taskForCheck = await taskStore.getTaskByChatId(chatId);
     if (taskForCheck) {
       if (taskForCheck.status === 'IN_REVIEW') {
-        // In Review 状态：用户发非命令消息 → 取消提醒计时器，状态回 IN_PROGRESS，继续执行
+        // In Review 状态：用户发非命令消息 → 取消提醒计时器，中止总结收集，状态回 IN_PROGRESS
         taskLifecycleHandler.cancelReviewNotify(chatId);
+        const sessionId = chatSessionStore.getSessionId(chatId);
+        if (sessionId) {
+          taskLifecycleHandler.clearSummaryState(sessionId);
+        }
         await taskStore.updateTaskStatus(chatId, 'IN_PROGRESS');
         await feishuClient.updateChatName(chatId, `🟡 ${taskForCheck.title}`);
         // 继续走正常 prompt 路由（不 return）
