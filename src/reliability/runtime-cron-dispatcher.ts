@@ -87,7 +87,8 @@ export function createRuntimeCronDispatcher(dependencies: RuntimeCronDispatcherD
         return;
       }
 
-      if (boundConversation) {
+      if (boundConversation
+        && !(boundConversation.platform === delivery.platform && boundConversation.conversationId === delivery.conversationId)) {
         throw new Error(
           `job ${job.id} bound session ${sessionId} is currently attached to ${boundConversation.platform}:${boundConversation.conversationId}`
         );

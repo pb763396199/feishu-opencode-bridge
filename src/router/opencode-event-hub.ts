@@ -19,6 +19,7 @@ import { permissionHandler } from '../permissions/handler.js';
 import { questionHandler } from '../opencode/question-handler.js';
 import { outputBuffer } from '../opencode/output-buffer.js';
 import { feishuClient } from '../feishu/client.js';
+import { taskLifecycleHandler } from '../handlers/task-lifecycle.js';
 
 // ==================== 类型定义 ====================
 
@@ -381,6 +382,10 @@ export class OpenCodeEventHub {
     // 2. 查找聊天 ID
     if (chatId && route) {
       enqueuePermissionRequest();
+      // 通知任务生命周期处理器（IN_PROGRESS → BLOCKED）
+      taskLifecycleHandler.onPermissionAsked(event.sessionId).catch(err => {
+        console.error('[EventHub] onPermissionAsked 失败:', err);
+      });
     } else {
       console.warn(
         `[权限] ⚠️ 未找到关联的群聊 (Session: ${event.sessionId}, parent=${event.parentSessionId || '-'}, related=${event.relatedSessionId || '-'}, call=${event.callId || '-'}, message=${event.messageId || '-'})，无法展示权限交互`
@@ -448,6 +453,11 @@ export class OpenCodeEventHub {
       outputBuffer.setStatus(bufferKey, 'completed');
     }
     this.clearUserMessageIds(sessionID);
+
+    // 通知任务生命周期处理器（IN_PROGRESS → IN_REVIEW）
+    taskLifecycleHandler.onSessionIdle(sessionID).catch(err => {
+      console.error('[EventHub] onSessionIdle 失败:', err);
+    });
   }
 
   private async handleMessageUpdated(event: unknown): Promise<void> {
@@ -770,15 +780,27 @@ export class OpenCodeEventHub {
     }
   }
 
-  private handleQuestionAsked(event: unknown): void {
+   private handleQuestionAsked(event: unknown): void {
     if (!this.context) return;
 
-    const { chatSessionStore, questionHandler, outputBuffer, upsertTimelineNote } = this.injectedDependencies();
+    const { chatSessionStore, questionHandler, outputBuffer, upsertTimelineNote, CORRELATION_CACHE_TTL_MS } = this.injectedDependencies();
 
     const request = event as import('../opencode/question-handler.js').QuestionRequest;
-    const chatId = chatSessionStore.getChatId(request.sessionID);
+
+    // 尝试通过本 session → parentSession → relatedSession 的顺序找到 chatId
+    // question 可能来自子 session（subagent），需要 fallback 到父 session 关联的群聊
+    let chatId = chatSessionStore.getChatId(request.sessionID);
+    if (!chatId && request.parentSessionID) {
+      chatId = chatSessionStore.getChatId(request.parentSessionID);
+    }
+    if (!chatId && request.relatedSessionID) {
+      chatId = chatSessionStore.getChatId(request.relatedSessionID);
+    }
 
     if (chatId) {
+      // 注册当前 sessionID 到 chatId 的别名，方便后续事件直接查找
+      chatSessionStore.rememberSessionAlias(request.sessionID, chatId, CORRELATION_CACHE_TTL_MS);
+
       const route = this.resolveConversationRoute(request.sessionID, chatId);
       console.log(`[问题] 收到提问: ${request.id} (Chat: ${chatId})`);
       const bufferKey = route.bufferKey;
@@ -789,6 +811,15 @@ export class OpenCodeEventHub {
       questionHandler.register(request, bufferKey, route.conversationId);
       upsertTimelineNote(bufferKey, `question:${request.sessionID}:${request.id}`, '🤝 问答交互（请在当前流式卡片中作答）', 'question');
       outputBuffer.touch(bufferKey);
+
+      // 通知任务生命周期处理器（IN_PROGRESS → BLOCKED）
+      taskLifecycleHandler.onQuestionAsked(request.sessionID).catch(err => {
+        console.error('[EventHub] onQuestionAsked 失败:', err);
+      });
+    } else {
+      console.warn(
+        `[问题] ⚠️ 未找到关联的群聊 (Session: ${request.sessionID}, parent=${request.parentSessionID || '-'}, related=${request.relatedSessionID || '-'})，无法展示问答交互`
+      );
     }
   }
 

@@ -22,12 +22,11 @@ export type TaskCommand =
   | 'task_title_set'
   | 'project_show'
   | 'workspace_show'
-  | 'todo'
-  | 'backlog'
+  | 'do'
   | 'done'
   | 'cancel'
   | 'followup'
-  | 'close_task';
+  | 'close';
 
 // 命令处理结果
 export interface TaskCommandResult {
@@ -71,11 +70,8 @@ class TaskCommandHandler {
       case 'workspace_show':
         return this.handleWorkspaceShow(task);
 
-      case 'todo':
-        return this.handleTodo(task, context.chatId, context.senderId);
-
-      case 'backlog':
-        return this.handleBacklog(task, context.senderId);
+      case 'do':
+        return this.handleDo(task, context.chatId, context.senderId);
 
       case 'done':
         return this.handleDone(task, context.senderId);
@@ -86,8 +82,8 @@ class TaskCommandHandler {
       case 'followup':
         return this.handleFollowup(task, context.senderId);
 
-      case 'close_task':
-        return this.handleCloseTask(task, context.senderId, context.chatId);
+      case 'close':
+        return this.handleClose(task, context.senderId, context.chatId);
 
       default:
         return { success: false, message: '未知命令' };
@@ -122,6 +118,14 @@ class TaskCommandHandler {
     });
 
     if (success) {
+      // 重新获取最新任务（含新的 description），异步发送任务信息卡片
+      taskStore.getTaskByChatId(chatId).then(updatedTask => {
+        if (updatedTask) {
+          feishuClient.sendCard(chatId, this.buildTaskInfoCard(updatedTask))
+            .catch(err => console.warn('[TaskCommand] 发送任务信息卡片失败:', err));
+        }
+      }).catch(err => console.warn('[TaskCommand] 获取更新后任务失败:', err));
+
       return { success: true, message: '✅ 已更新任务内容' };
     }
     return { success: false, message: '❌ 更新任务内容失败' };
@@ -157,8 +161,9 @@ class TaskCommandHandler {
     });
 
     if (success) {
-      // 同步更新飞书群名（设计文档 §10.8）
-      const renameOk = await feishuClient.updateChatName(chatId, trimmedTitle);
+      // 同步更新飞书群名（保留状态圆圈前缀）
+      const statusEmoji = this.getStatusEmoji(task.status);
+      const renameOk = await feishuClient.updateChatName(chatId, `${statusEmoji} ${trimmedTitle}`);
       if (!renameOk) {
         console.warn(`[TaskCommand] 更新群名失败: chatId=${chatId}`);
       }
@@ -213,7 +218,7 @@ class TaskCommandHandler {
     };
   }
 
-  private async handleTodo(task: Task | null, chatId: string, senderId: string): Promise<TaskCommandResult> {
+  private async handleDo(task: Task | null, chatId: string, senderId: string): Promise<TaskCommandResult> {
     if (!task) {
       return { success: false, message: '当前群不是任务群' };
     }
@@ -223,20 +228,18 @@ class TaskCommandHandler {
       return { success: false, message: '❌ 仅任务创建者可以执行此操作' };
     }
 
-    // 状态检查：只允许从 INBOX 或 TODO 启动（防止重复启动和状态回退）
-    if (!['INBOX', 'TODO'].includes(task.status)) {
-      const statusLabels: Record<string, string> = {
-        DONE: '已完成',
-        CANCELLED: '已取消',
-        IN_PROGRESS: '进行中',
-        BLOCKED: '被阻塞',
-        BACKLOG: '待规划',
-      };
-      const statusLabel = statusLabels[task.status] || task.status;
-      return {
-        success: false,
-        message: `⚠️ 任务当前状态为「${statusLabel}」，无法重复启动`,
-      };
+    // 针对不同状态给出精准错误提示
+    const statusMessages: Partial<Record<string, string>> = {
+      IN_PROGRESS: '⚠️ AI 正在处理中，请等待完成',
+      BLOCKED:     '⚠️ 请先处理阻塞（权限授权或回答问题）',
+      IN_REVIEW:   '⚠️ 请直接发送消息来继续执行，或 /done 确认完成',
+      DONE:        '⚠️ 任务已完成，无法重新执行',
+      CANCELLED:   '⚠️ 任务已取消，无法执行',
+    };
+
+    if (task.status !== 'TODO') {
+      const msg = statusMessages[task.status] || `⚠️ 当前状态「${task.status}」不支持此操作`;
+      return { success: false, message: msg };
     }
 
     const description = task.description?.trim();
@@ -247,13 +250,16 @@ class TaskCommandHandler {
       };
     }
 
-    // 更新任务状态为 TODO
-    const statusOk = await taskStore.updateTaskStatus(chatId, 'TODO');
+    // 更新任务状态为 IN_PROGRESS
+    const statusOk = await taskStore.updateTaskStatus(chatId, 'IN_PROGRESS');
     if (!statusOk) {
       return { success: false, message: '❌ 更新任务状态失败' };
     }
 
-    // 将任务描述发送给 OpenCode
+    // 同步群标题
+    await feishuClient.updateChatName(chatId, `🟡 ${task.title}`);
+
+    // 获取 Opencode 会话
     const session = chatSessionStore.getSession(chatId);
     if (!session?.sessionId) {
       return {
@@ -262,42 +268,13 @@ class TaskCommandHandler {
       };
     }
 
-    // 先返回确认消息，再异步发给 OpenCode
-    // 避免 OpenCode 流式回复比确认消息先到达飞书群
-    const confirmMessage = `✅ 已启动执行！AI 正在处理：\n> ${description.slice(0, 100)}${description.length > 100 ? '...' : ''}`;
-
-    // 异步发送给 OpenCode（不 await，让确认消息先发出）
+    // 异步发送给 Opencode（不 await，让确认消息先发出）
     opencodeClient.sendMessage(session.sessionId, description)
-      .then(() => console.log(`[TaskCommand] /todo 已将任务描述发给 OpenCode: session=${session.sessionId}`))
+      .then(() => console.log(`[TaskCommand] /do 已将任务描述发给 OpenCode: session=${session.sessionId}`))
       .catch(err => console.error('[TaskCommand] 发送任务描述到 OpenCode 失败:', err));
 
+    const confirmMessage = `🚀 已启动执行！AI 正在处理：\n> ${description.slice(0, 100)}${description.length > 100 ? '...' : ''}`;
     return { success: true, message: confirmMessage };
-  }
-
-  private async handleBacklog(task: Task | null, senderId: string): Promise<TaskCommandResult> {
-    if (!task) {
-      return { success: false, message: '当前群不是任务群' };
-    }
-
-    // 验证权限：只有创建者可以操作
-    if (task.creator_open_id !== senderId) {
-      return { success: false, message: '❌ 仅任务创建者可以执行此操作' };
-    }
-
-    // 已取消的任务不能再移到待规划
-    if (task.status === 'CANCELLED') {
-      return {
-        success: false,
-        message: '⚠️ 任务已取消，无法移至待规划',
-      };
-    }
-
-    const success = await taskStore.updateTaskStatus(task.chat_id, 'BACKLOG');
-
-    if (success) {
-      return { success: true, message: '✅ 已移至待规划' };
-    }
-    return { success: false, message: '❌ 更新状态失败' };
   }
 
   private async handleDone(task: Task | null, senderId: string): Promise<TaskCommandResult> {
@@ -309,19 +286,18 @@ class TaskCommandHandler {
       return { success: false, message: '❌ 仅任务创建者可以执行此操作' };
     }
 
-    // 已取消的任务不能再完成
-    if (task.status === 'CANCELLED') {
-      return {
-        success: false,
-        message: '⚠️ 任务已取消，无法完成',
-      };
-    }
+    // 针对不同状态给出精准提示
+    const statusMessages: Partial<Record<string, string>> = {
+      TODO:        '⚠️ 请先执行 /do 启动任务',
+      IN_PROGRESS: '⚠️ AI 正在执行中，请等待完成后验收',
+      BLOCKED:     '⚠️ 请先处理阻塞后再完成',
+      DONE:        '⚠️ 任务已完成，无需重复操作',
+      CANCELLED:   '⚠️ 任务已取消，无法完成',
+    };
 
-    if (task.status === 'BLOCKED') {
-      return {
-        success: false,
-        message: '⚠️ 任务当前被阻塞，请先处理阻塞后再完成',
-      };
+    if (task.status !== 'IN_REVIEW') {
+      const msg = statusMessages[task.status] || `⚠️ 当前状态「${task.status}」不支持此操作`;
+      return { success: false, message: msg };
     }
 
     // 返回确认卡片
@@ -349,7 +325,14 @@ class TaskCommandHandler {
       };
     }
 
-    // 返回确认卡片（与 /done 一致）
+    if (task.status === 'DONE') {
+      return {
+        success: false,
+        message: '⚠️ 任务已完成，无法取消',
+      };
+    }
+
+    // 返回确认卡片（传入状态，供卡片提示是否有 AI 在运行）
     return {
       success: true,
       message: '',
@@ -389,7 +372,7 @@ class TaskCommandHandler {
     };
   }
 
-  private async handleCloseTask(
+  private async handleClose(
     task: Task | null,
     senderId: string,
     chatId: string
@@ -413,11 +396,79 @@ class TaskCommandHandler {
     return {
       success: true,
       message: '',
-      card: this.buildCloseTaskConfirmCard(task),
+      card: this.buildCloseConfirmCard(task),
     };
   }
 
+  // ===== 辅助方法 =====
+
+  /**
+   * 根据状态返回对应的状态圆圈 emoji
+   */
+  getStatusEmoji(status: string): string {
+    const emojiMap: Record<string, string> = {
+      TODO:        '🔵',
+      IN_PROGRESS: '🟡',
+      BLOCKED:     '🔴',
+      IN_REVIEW:   '🟣',
+      DONE:        '🟢',
+      CANCELLED:   '⚫',
+    };
+    return emojiMap[status] ?? '📋';
+  }
+
   // ===== 卡片构建方法 =====
+
+  /**
+   * 构建任务信息卡片（含「▶ 执行任务」按钮）
+   * public 以便 card-action.ts 和 p2p.ts 调用
+   */
+  buildTaskInfoCard(task: Task): Record<string, unknown> {
+    const isExecutable = task.status === 'TODO';
+    const statusLabel = TASK_STATUS_LABELS[task.status as keyof typeof TASK_STATUS_LABELS] ?? task.status;
+    const desc = task.description
+      ? task.description.slice(0, 300) + (task.description.length > 300 ? '...' : '')
+      : '（未设置任务内容，使用 `/task <内容>` 填写）';
+
+    return {
+      config: { wide_screen_mode: true },
+      header: {
+        template: 'blue',
+        title: { tag: 'plain_text', content: `📋 ${task.title}` },
+      },
+      elements: [
+        {
+          tag: 'div',
+          text: { tag: 'lark_md', content: desc },
+        },
+        {
+          tag: 'div',
+          fields: [
+            { is_short: true, text: { tag: 'lark_md', content: `**状态**：${statusLabel}` } },
+            { is_short: true, text: { tag: 'lark_md', content: `**优先级**：${task.priority}` } },
+          ],
+        },
+        {
+          tag: 'div',
+          text: { tag: 'lark_md', content: `**工作目录**：${task.workspace_path}` },
+        },
+        { tag: 'hr' },
+        {
+          tag: 'action',
+          actions: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: '▶ 执行任务' },
+              type: 'primary',
+              ...(isExecutable ? {} : { disabled: true, disabled_tip: `当前状态：${statusLabel}` }),
+              action_type: 'request',
+              value: { action: 'task_do', task_id: task.task_id, chat_id: task.chat_id },
+            },
+          ],
+        },
+      ],
+    };
+  }
 
   private buildDoneConfirmCard(task: Task): Record<string, unknown> {
     return {
@@ -462,7 +513,7 @@ class TaskCommandHandler {
     };
   }
 
-  private buildCloseTaskConfirmCard(task: Task): Record<string, unknown> {
+  private buildCloseConfirmCard(task: Task): Record<string, unknown> {
     return {
       config: {
         wide_screen_mode: true,
@@ -506,6 +557,11 @@ class TaskCommandHandler {
   }
 
   private buildCancelConfirmCard(task: Task): Record<string, unknown> {
+    const isRunning = task.status === 'IN_PROGRESS';
+    const extraNote = isRunning
+      ? '\n• AI 正在执行，取消将同时停止 AI 工作'
+      : '';
+
     return {
       config: {
         wide_screen_mode: true,
@@ -522,7 +578,7 @@ class TaskCommandHandler {
           tag: 'div',
           text: {
             tag: 'lark_md',
-            content: '**确认后：**\n• 任务状态将变为已取消\n• 任务将在看板中隐藏\n• 之后可使用 `/close_task` 解散任务群',
+            content: `**确认后：**\n• 任务状态将变为已取消\n• 任务将在看板中隐藏${extraNote}\n• 之后可使用 \`/close\` 解散任务群`,
           },
         },
         {
@@ -540,7 +596,12 @@ class TaskCommandHandler {
               text: { tag: 'plain_text', content: '确认取消' },
               type: 'danger',
               action_type: 'request',
-              value: { action: 'cancel_confirm', task_id: task.task_id, chat_id: task.chat_id },
+              value: {
+                action: 'cancel_confirm',
+                task_id: task.task_id,
+                chat_id: task.chat_id,
+                abort_session: isRunning,
+              },
             },
           ],
         },

@@ -8,6 +8,7 @@ import { parseCommand } from '../commands/parser.js';
 import type { EffortLevel } from '../commands/effort.js';
 import { commandHandler } from './command.js';
 import { taskStore } from '../store/task-store.js';
+import { taskLifecycleHandler } from './task-lifecycle.js';
 import { modelConfig, attachmentConfig } from '../config.js';
 import { DirectoryPolicy } from '../utils/directory-policy.js';
 import { buildSessionTimestamp } from '../utils/session-title.js';
@@ -137,14 +138,24 @@ export class GroupHandler {
       return;
     }
 
-    // 2. 任务群：INBOX/BACKLOG/TODO 状态下拦截非命令消息（设计文档 §10.6）
+    // 2. 任务群消息路由：根据任务状态决定处理方式
     const taskForCheck = await taskStore.getTaskByChatId(chatId);
-    if (taskForCheck && ['INBOX', 'BACKLOG', 'TODO'].includes(taskForCheck.status)) {
-      await feishuClient.reply(
-        messageId,
-        '⚠️ 任务尚未启动，请先发送 `/todo` 开始执行。\n   如需修改任务内容，请使用 `/task <新内容>`'
-      );
-      return;
+    if (taskForCheck) {
+      if (taskForCheck.status === 'IN_REVIEW') {
+        // In Review 状态：用户发非命令消息 → 取消提醒计时器，状态回 IN_PROGRESS，继续执行
+        taskLifecycleHandler.cancelReviewNotify(chatId);
+        await taskStore.updateTaskStatus(chatId, 'IN_PROGRESS');
+        await feishuClient.updateChatName(chatId, `🟡 ${taskForCheck.title}`);
+        // 继续走正常 prompt 路由（不 return）
+      } else if (taskForCheck.status === 'TODO') {
+        // To Do 状态：拦截非命令消息，提示使用 /do
+        await feishuClient.reply(
+          messageId,
+          '⚠️ 任务尚未启动，请先发送 `/do` 开始执行。\n   如需修改任务内容，请使用 `/task <新内容>`'
+        );
+        return;
+      }
+      // BLOCKED / IN_PROGRESS / DONE / CANCELLED：不拦截，让消息正常路由到 Opencode 或问题处理
     }
 
     // 3. 检查是否有待回答的问题
@@ -300,6 +311,10 @@ export class GroupHandler {
       if (success) {
           questionHandler.remove(pending.request.id);
           outputBuffer.touch(`chat:${chatId}`);
+          // 问题已回答 → 解除 BLOCKED 状态
+          taskLifecycleHandler.onBlockedResolved(pending.request.sessionID).catch(err => {
+            console.error('[Group] onBlockedResolved 失败:', err);
+          });
       } else {
           await feishuClient.reply(replyMessageId, '⚠️ 回答提交失败，请重试');
       }

@@ -35,12 +35,11 @@ export type CommandType =
   // ===== 任务群专属命令 =====
   | 'task'            // 查看或设置任务内容
   | 'task_title'      // 查看或设置任务标题
-  | 'task_todo'       // 标记为待执行
-  | 'task_backlog'    // 移至待规划
-  | 'task_done'       // 标记完成（需确认）
+  | 'task_do'         // 启动 AI 执行任务（To Do → In Progress）
+  | 'task_done'       // 标记完成（需确认，仅 In Review 状态）
   | 'task_cancel'     // 取消任务
   | 'task_followup'   // 创建续集任务
-  | 'task_close_task' // 解散任务群（需确认）
+  | 'task_close'      // 解散任务群（需确认）
   | 'create_task'     // 创建任务群（弹卡片）
   ;
 
@@ -491,11 +490,8 @@ export function parseCommand(text: string): ParsedCommand {
         }
         return { type: 'workspace', workspaceAction: 'set', workspacePath: args.join(' ') };
 
-      case 'todo':
-        return { type: 'task_todo' };
-
-      case 'backlog':
-        return { type: 'task_backlog' };
+      case 'do':
+        return { type: 'task_do' };
 
       case 'done':
         return { type: 'task_done' };
@@ -508,10 +504,8 @@ export function parseCommand(text: string): ParsedCommand {
       case 'followup':
         return { type: 'task_followup' };
 
-      case 'close_task':
-      case 'closetask':
-      case 'close-task':
-        return { type: 'task_close_task' };
+      case 'close':
+        return { type: 'task_close' };
 
       default:
         // 未知命令透传到OpenCode（保留原始大小写）
@@ -569,16 +563,15 @@ export function getHelpText(isTaskChat: boolean = false): string {
 
   // 任务群专属命令
   const taskCommands = `📋 **任务群专属命令**
-• \`/task\` 查看任务内容
-• \`/task <内容>\` 设置任务内容
-• \`/task_title\` 查看任务标题
-• \`/task_title <标题>\` 修改任务标题（同步修改群名）
-• \`/project\` 查看所属项目名称
-• \`/todo\` 标记任务为待执行
-• \`/backlog\` 移至待规划
-• \`/done\` 标记任务完成
-• \`/cancel\` 取消任务
-• \`/close_task\` 解散任务群`;
+• \`/task\`                查看任务内容
+• \`/task <内容>\`          设置任务内容（同时更新任务信息卡片）
+• \`/task_title\`           查看任务标题
+• \`/task_title <标题>\`    修改任务标题（同步修改群名）
+• \`/project\`             查看所属项目名称
+• \`/do\`                  启动 AI 执行任务（To Do → In Progress）
+• \`/done\`                标记任务完成（需在 In Review 状态）
+• \`/cancel\`              取消任务
+• \`/close\`               解散任务群（仅限 Done 或 Cancelled 状态）`;
 
   // 构建帮助文本
   let helpText = `📖 **飞书 × OpenCode 机器人指南**

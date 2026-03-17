@@ -256,7 +256,7 @@ class BitableClient {
 
     const fields: Record<string, unknown> = {
       [TASK_FIELDS.title]: input.title,
-      [TASK_FIELDS.status]: TASK_STATUS_LABELS.INBOX,
+      [TASK_FIELDS.status]: TASK_STATUS_LABELS.TODO,
       [TASK_FIELDS.priority]: TASK_PRIORITY_LABELS.medium,
       [TASK_FIELDS.health]: 'GREEN',
       [TASK_FIELDS.assignee]: input.creator_open_id,  // 文本字段（type=1），直接写 open_id
@@ -566,12 +566,12 @@ class BitableClient {
   }
 
   private parseStatus(value: unknown): TaskStatus {
-    if (!value || typeof value !== 'string') return 'INBOX';
+    if (!value || typeof value !== 'string') return 'TODO';
     const label = value.trim();
     for (const [key, val] of Object.entries(TASK_STATUS_LABELS)) {
       if (val === label) return key as TaskStatus;
     }
-    return 'INBOX';
+    return 'TODO';
   }
 
   private parsePriority(value: unknown): TaskPriority {

@@ -896,12 +896,8 @@ export class CommandHandler {
           break;
         }
 
-        case 'task_todo':
-          await this.handleTaskCommand(chatId, messageId, context.senderId, 'todo');
-          break;
-
-        case 'task_backlog':
-          await this.handleTaskCommand(chatId, messageId, context.senderId, 'backlog');
+        case 'task_do':
+          await this.handleTaskCommand(chatId, messageId, context.senderId, 'do');
           break;
 
         case 'task_done':
@@ -916,8 +912,8 @@ export class CommandHandler {
           await this.handleTaskCommand(chatId, messageId, context.senderId, 'followup');
           break;
 
-        case 'task_close_task':
-          await this.handleTaskCommand(chatId, messageId, context.senderId, 'close_task');
+        case 'task_close':
+          await this.handleTaskCommand(chatId, messageId, context.senderId, 'close');
           break;
 
         case 'whoami':
@@ -1114,12 +1110,12 @@ export class CommandHandler {
       await taskStore.updateTaskFields(chatId, {
         opencode_session_id: session.id,
       });
-      // 4. 任务状态重置为 INBOX
-      await taskStore.updateTaskStatus(chatId, 'INBOX');
+      // 4. 任务状态重置为 TODO
+      await taskStore.updateTaskStatus(chatId, 'TODO');
 
       await feishuClient.reply(
         messageId,
-        `⚠️ 对话历史已重置，新 Session 已创建\n\nID: ${session.id}\n📂 工作目录: ${session.directory || task.workspace_path}\n\n任务状态已重置为「待分类」，使用 \`/todo\` 重新开始执行`
+        `⚠️ 对话历史已重置，新 Session 已创建\n\nID: ${session.id}\n📂 工作目录: ${session.directory || task.workspace_path}\n\n任务状态已重置为「To Do」，使用 \`/do\` 重新开始执行`
       );
     } catch (error) {
       console.error('[Command] 任务群 Session 重置失败:', error);

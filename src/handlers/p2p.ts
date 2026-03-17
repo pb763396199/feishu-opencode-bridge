@@ -16,6 +16,7 @@ import { buildSessionTimestamp } from '../utils/session-title.js';
 import { parseCommand, getHelpText, type ParsedCommand } from '../commands/parser.js';
 import { commandHandler } from './command.js';
 import { groupHandler } from './group.js';
+import { taskCommandHandler } from '../commands/task-commands.js';
 import { directoryConfig, userConfig } from '../config.js';
 
 interface EnsurePrivateSessionResult {
@@ -819,28 +820,18 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       console.warn('[P2P] 任务写入 Bitable 失败，任务群仍正常创建');
     }
 
-    // 7. 群内发第一条消息（任务群专属命令说明）
-    const taskGroupHelp = [
-      `📋 **任务群已创建：${taskTitle}**`,
-      '',
-      '**执行控制**',
-      '  `/todo`                用任务内容启动 AI 执行',
-      '  `/done`                标记任务完成',
-      '  `/cancel`              取消任务',
-      '',
-      '**任务管理**',
-      '  `/task`                显示当前任务内容',
-      '  `/task <新内容>`        修改任务内容',
-      '  `/task_title <新标题>`  修改任务标题',
-      '',
-      '**项目与工作区**',
-      '  `/project`             显示所属项目',
-      '  `/workspace`           显示工作目录',
-      '',
-      '  `/close_chat`          解散任务群（仅已完成任务）',
-    ].join('\n');
+    // 7. 更新群标题（初始状态 To Do）
+    await feishuClient.updateChatName(newChatId, `🔵 ${taskTitle}`);
 
-    await feishuClient.sendText(newChatId, taskGroupHelp);
+    // 7.5 发送任务信息卡片（含「▶ 执行任务」按钮）
+    const latestTask = await taskStore.getTaskByChatId(newChatId);
+    if (latestTask) {
+      try {
+        await feishuClient.sendCard(newChatId, taskCommandHandler.buildTaskInfoCard(latestTask));
+      } catch (err) {
+        console.warn('[P2P] 发送任务信息卡片失败:', err);
+      }
+    }
 
     // 8. 发送控制面板
     try {

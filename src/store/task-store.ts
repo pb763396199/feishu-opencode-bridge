@@ -162,7 +162,7 @@ async getTaskByChatIdFromSource(chatId: string): Promise<Task | null> {
       description: input.description ?? null,
       workspace_path: input.workspace_path,
       creator_open_id: input.creator_open_id,
-      status: 'INBOX',
+      status: 'TODO',
       priority: 'medium',
       health: 'GREEN',
       blocked_reason: null,
@@ -255,6 +255,13 @@ async getTaskByChatIdFromSource(chatId: string): Promise<Task | null> {
   }
 
   /**
+   * 标记任务为待验收（In Review）
+   */
+  async setInReview(chatId: string): Promise<boolean> {
+    return this.updateTaskStatus(chatId, 'IN_REVIEW');
+  }
+
+  /**
    * 清除任务阻塞状态
    */
   async clearBlocked(chatId: string): Promise<boolean> {
@@ -303,6 +310,8 @@ async getTaskByChatIdFromSource(chatId: string): Promise<Task | null> {
       hidden: true,
     });
     if (success) {
+      task.hidden = true;  // 同步更新缓存
+      this.updateCache(chatId, task);
       await this.updateTaskStatus(chatId, 'CANCELLED');
     }
     return success;
