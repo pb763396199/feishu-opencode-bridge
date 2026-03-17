@@ -301,12 +301,36 @@ export class BitableBootstrap {
       { field_name: PROJECT_FIELDS.project_id, type: 1 },
       { field_name: PROJECT_FIELDS.repo_url, type: 15 },  // 15 = URL 类型（已验证）
       // P2-A: 项目总表扩展字段（必须在 bootstrap 阶段创建，保证 health-check 能通过）
-      { field_name: PROJECT_FIELDS.task_table_id, type: 1 },           // 项目专属任务表ID
+      { field_name: PROJECT_FIELDS.task_table_id, type: 15 },          // 项目专属任务表超链接
       { field_name: PROJECT_FIELDS.default_execution_agent, type: 1 }, // 默认执行Agent
       { field_name: PROJECT_FIELDS.workspace_paths, type: 1 },         // 工作目录配置（JSON）
       { field_name: PROJECT_FIELDS.created_at, type: 5 },
       { field_name: PROJECT_FIELDS.updated_at, type: 5 },
     ];
+  }
+
+  private async migrateProjectTaskTableField(appToken: string, projectTableId: string): Promise<void> {
+    const fields = await bitableClient.listFieldsWithId(appToken, projectTableId);
+    const newField = fields.find(field => field.field_name === PROJECT_FIELDS.task_table_id);
+    if (newField) {
+      return;
+    }
+
+    const legacyField = fields.find(field => field.field_name === '任务表ID');
+    if (legacyField) {
+      const renamed = await bitableClient.renameField(
+        appToken,
+        projectTableId,
+        legacyField.field_id,
+        PROJECT_FIELDS.task_table_id,
+        15,
+      );
+      if (renamed) {
+        console.log('[Bootstrap] 项目表字段“任务表ID”已升级为“任务表”超链接');
+        return;
+      }
+      console.warn('[Bootstrap] 项目表字段“任务表ID”升级失败，将继续走缺失字段补创');
+    }
   }
 
   private async createRemainingFields(
@@ -389,6 +413,8 @@ export class BitableBootstrap {
       this.state = { ...this.state, created_fields: [] };
       await this.createRemainingFields(appToken, taskTableId, projectTableId);
     }
+
+    await this.migrateProjectTaskTableField(appToken, projectTableId);
 
     const savedVersion = this.state.schema_version;
     if (savedVersion && savedVersion !== BITABLE_SCHEMA_VERSION) {

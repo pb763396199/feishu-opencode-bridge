@@ -90,7 +90,7 @@ describe('Bitable createTask 路由优先级', () => {
     expect(task?.project_id).toBe('proj_123');
   });
 
-  it('项目任务表写回项目总表时应持久化任务表链接，而不是裸 table_id', async () => {
+  it('项目任务表写回项目总表时应持久化超链接对象，而不是裸 table_id', async () => {
     const internalClient = bitableClient as unknown as InternalBitableClient;
     const apiFetchSpy = vi.spyOn(internalClient, 'apiFetch').mockResolvedValue({ code: 0 });
 
@@ -101,7 +101,10 @@ describe('Bitable createTask 路由优先级', () => {
     const requestBody = JSON.parse(String(apiFetchSpy.mock.calls[0]?.[1]?.body ?? '{}')) as {
       fields?: Record<string, unknown>;
     };
-    expect(requestBody.fields?.[PROJECT_FIELDS.task_table_id]).toBe('https://feishu.cn/base/app_token?table=tbl_project_123');
+    expect(requestBody.fields?.[PROJECT_FIELDS.task_table_id]).toEqual({
+      link: 'https://feishu.cn/base/app_token?table=tbl_project_123',
+      text: '打开任务表',
+    });
   });
 
   it('项目记录中的任务表字段为链接时，应仍能解析出内部 table_id 用于路由', () => {
