@@ -15,14 +15,15 @@
  *   3 - v3.0修正：状态标签改回中文（待执行/进行中/被阻塞/待验收/已完成/已取消）
  *   4 - P1 收口：删除 health，assignee 重命名为 execution_agent，hidden 重命名为 archived
  *   5 - P2：项目总表扩展字段，支持每项目独立任务表
+ *   6 - 项目表“任务表ID”字段升级为“任务表”超链接字段
  */
-export const BITABLE_SCHEMA_VERSION = '5';
+export const BITABLE_SCHEMA_VERSION = '6';
 
 export const PROJECT_FIELDS = {
   project_id:              '项目ID',
   name:                    '项目名称',
   repo_url:                '仓库地址',
-  task_table_id:           '任务表ID',           // P2: 该项目专属任务表的 table_id
+  task_table_id:           '任务表',             // P2: 该项目专属任务表的超链接
   default_execution_agent: '默认执行Agent',       // P2: 该项目任务的默认执行 Agent
   workspace_paths:         '工作目录配置',       // P2: 该项目可用的工作目录（JSON）
   created_at:              '创建时间',

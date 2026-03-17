@@ -266,11 +266,11 @@ class BitableClient {
     const taskTableLink = this.buildBitableTableUrl(config.appToken, taskTableId);
     const updateResult = await this.apiFetch(
       `/bitable/v1/apps/${config.appToken}/tables/${config.projectTableId}/records/${projectId}?user_id_type=open_id`,
-      {
-        method: 'PUT',
-        body: JSON.stringify({
-          fields: {
-            [PROJECT_FIELDS.task_table_id]: taskTableLink,
+        {
+          method: 'PUT',
+          body: JSON.stringify({
+            fields: {
+            [PROJECT_FIELDS.task_table_id]: { link: taskTableLink, text: '打开任务表' },
             [PROJECT_FIELDS.updated_at]: Date.now(),
           },
         }),

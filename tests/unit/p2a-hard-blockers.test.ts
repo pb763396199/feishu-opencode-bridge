@@ -46,7 +46,7 @@ describe('P2-A 硬阻断器闭环', () => {
     it('PROJECT_FIELDS 必须包含全部 P2 字段', () => {
       // 验证 bitable-fields.ts 中定义了所有必需的 P2 字段
       expect(PROJECT_FIELDS.task_table_id).toBeDefined();
-      expect(PROJECT_FIELDS.task_table_id).toBe('任务表ID');
+      expect(PROJECT_FIELDS.task_table_id).toBe('任务表');
 
       expect(PROJECT_FIELDS.default_execution_agent).toBeDefined();
       expect(PROJECT_FIELDS.default_execution_agent).toBe('默认执行Agent');
@@ -56,19 +56,19 @@ describe('P2-A 硬阻断器闭环', () => {
 
       // 验证所有项目字段都存在（保证 bootstrap 可以遍历创建）
       const allProjectFieldNames = Object.values(PROJECT_FIELDS);
-      expect(allProjectFieldNames).toContain('任务表ID');
+      expect(allProjectFieldNames).toContain('任务表');
       expect(allProjectFieldNames).toContain('默认执行Agent');
       expect(allProjectFieldNames).toContain('工作目录配置');
     });
 
-    it('Schema 版本必须为 5（P2 版本）', () => {
-      expect(BITABLE_SCHEMA_VERSION).toBe('5');
+    it('Schema 版本必须为 6（任务表链接字段升级版本）', () => {
+      expect(BITABLE_SCHEMA_VERSION).toBe('6');
     });
 
     it('Health-check 必须检查项目表 P2 字段缺失并自动补创', async () => {
       // 模拟项目表缺少 P2 字段的场景
       const existingProjectFields = ['项目名称', '仓库地址', '创建时间', '更新时间'];
-      // 缺少：任务表ID、默认执行Agent、工作目录配置
+      // 缺少：任务表、默认执行Agent、工作目录配置
 
       mockListFields.mockResolvedValue(existingProjectFields);
       mockCreateField.mockResolvedValue(true);
@@ -87,7 +87,7 @@ describe('P2-A 硬阻断器闭环', () => {
       ].filter(f => !fields.includes(f));
 
       expect(missingP2Fields).toHaveLength(3);
-      expect(missingP2Fields).toContain('任务表ID');
+      expect(missingP2Fields).toContain('任务表');
       expect(missingP2Fields).toContain('默认执行Agent');
       expect(missingP2Fields).toContain('工作目录配置');
 
@@ -99,7 +99,7 @@ describe('P2-A 硬阻断器闭环', () => {
       expect(mockCreateField).toHaveBeenCalledTimes(3);
       // 验证三个 P2 字段都被创建（不指定顺序）
       const createdFields = mockCreateField.mock.calls.map(call => call[2]);
-      expect(createdFields).toContain('任务表ID');
+      expect(createdFields).toContain('任务表');
       expect(createdFields).toContain('默认执行Agent');
       expect(createdFields).toContain('工作目录配置');
     });
@@ -125,7 +125,7 @@ describe('P2-A 硬阻断器闭环', () => {
       // 验证字段类型正确
       const taskTableIdField = fieldDefs.find((f: any) => f.field_name === PROJECT_FIELDS.task_table_id);
       expect(taskTableIdField).toBeDefined();
-      expect(taskTableIdField.type).toBe(1); // 文本类型
+      expect(taskTableIdField.type).toBe(15); // 超链接类型
     });
   });
 
