@@ -261,6 +261,9 @@ export interface FeishuCardActionEvent {
   action: {
     tag: string;
     value: Record<string, unknown>;
+    // form 容器提交时，input/select_static 值通过 form_value 传递
+    form_value?: Record<string, string>;
+    option?: unknown;
   };
   token: string;
   messageId?: string;
@@ -275,8 +278,17 @@ class FeishuClient extends EventEmitter {
   private client: lark.Client;
   private wsClient: lark.WSClient | null = null;
   private eventDispatcher: lark.EventDispatcher;
+
+  // 提供 lark SDK client 的访问入口（用于 Bitable 等高级 API）
+  get lark(): lark.Client {
+    return this.client;
+  }
   private cardActionHandler?: (event: FeishuCardActionEvent) => Promise<FeishuCardActionResponse | void>;
   private cardUpdateQueue: Map<string, Promise<boolean>> = new Map();
+
+  // 消息去重：飞书 WebSocket 在服务重启时可能重复推送未 ACK 的消息
+  private processedMessageIds = new Set<string>();
+  private readonly MESSAGE_DEDUP_TTL_MS = 5 * 60 * 1000;  // 5 分钟 TTL
 
   constructor() {
     super();
@@ -466,6 +478,17 @@ class FeishuClient extends EventEmitter {
         rawEvent: data,
       };
 
+      // 消息去重（飞书 WebSocket 重连时可能重复推送）
+      const msgId = messageEvent.messageId;
+      if (msgId && this.processedMessageIds.has(msgId)) {
+        console.warn(`[飞书] 重复消息已忽略: ${msgId}`);
+        return;
+      }
+      if (msgId) {
+        this.processedMessageIds.add(msgId);
+        setTimeout(() => this.processedMessageIds.delete(msgId), this.MESSAGE_DEDUP_TTL_MS);
+      }
+
       this.emit('message', messageEvent);
     } catch (error) {
       console.error('[飞书] 解析消息失败:', error);
@@ -560,6 +583,29 @@ class FeishuClient extends EventEmitter {
     } catch (error) {
       const formatted = formatError(error);
       console.error('[飞书] 下载消息资源失败:', formatted.message, formatted.responseData ?? '');
+      return null;
+    }
+  }
+
+  // 发送私聊文本消息（通过 open_id 直接发给用户）
+  async sendDirectMessage(openId: string, text: string): Promise<string | null> {
+    try {
+      const response = await this.client.im.message.create({
+        params: { receive_id_type: 'open_id' },
+        data: {
+          receive_id: openId,
+          msg_type: 'text',
+          content: JSON.stringify({ text }),
+        },
+      });
+      const msgId = response.data?.message_id || null;
+      if (msgId) {
+        console.log(`[飞书] 私聊发送成功: openId=${openId.slice(0, 12)}..., msgId=${msgId.slice(0, 16)}...`);
+      }
+      return msgId;
+    } catch (error) {
+      const formatted = formatError(error);
+      console.error(`[飞书] 私聊发送失败: openId=${openId}, ${formatted.message}`);
       return null;
     }
   }
@@ -868,7 +914,13 @@ class FeishuClient extends EventEmitter {
       return true;
     } catch (error) {
       const formatted = formatError(error);
-      console.error('[飞书] 解散群聊失败:', formatted.message, formatted.responseData ?? '');
+      const errorCode = extractApiCode(formatted.responseData);
+      // 232009 = 群已解散，这是预期内的场景（事件驱动），降级为 warn
+      if (errorCode === 232009) {
+        console.warn(`[飞书] 群 ${chatId} 已被解散，无需重复操作`);
+      } else {
+        console.error('[飞书] 解散群聊失败:', formatted.message, formatted.responseData ?? '');
+      }
       return false;
     }
   }
@@ -903,7 +955,13 @@ class FeishuClient extends EventEmitter {
       return memberIds;
     } catch (error) {
       const formatted = formatError(error);
-      console.error('[飞书] 获取群成员失败:', formatted.message, formatted.responseData ?? '');
+      const errorCode = extractApiCode(formatted.responseData);
+      // 232009 = 群已解散, 232011 = 操作者不在群里，都是预期内的场景，降级为 warn
+      if (errorCode === 232009 || errorCode === 232011) {
+        console.warn(`[飞书] 群成员查询失败（群已解散或已退出）: chatId=${chatId}`);
+      } else {
+        console.error('[飞书] 获取群成员失败:', formatted.message, formatted.responseData ?? '');
+      }
       return [];
     }
   }
@@ -1110,6 +1168,27 @@ class FeishuClient extends EventEmitter {
       this.wsClient = null;
     }
     console.log('[飞书] 已断开连接');
+  }
+
+  /**
+   * 修改飞书群名
+   */
+  async updateChatName(chatId: string, name: string): Promise<boolean> {
+    try {
+      const result = await this.lark.im.chat.update({
+        path: { chat_id: chatId },
+        data: { name },
+      });
+      if (result.code === 0) {
+        console.log(`[飞书] 更新群名成功: chatId=${chatId}, name=${name}`);
+        return true;
+      }
+      console.warn(`[飞书] 更新群名失败: code=${result.code}, msg=${result.msg}`);
+      return false;
+    } catch (err) {
+      console.warn('[飞书] 更新群名异常:', err);
+      return false;
+    }
   }
 }
 

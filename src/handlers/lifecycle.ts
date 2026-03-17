@@ -15,6 +15,31 @@ export interface CleanupStats {
 }
 
 export class LifecycleHandler {
+  // 正在解散的群聊集合（防止事件处理器重复操作）
+  private dissolvingChats = new Set<string>();
+
+  /**
+   * 标记群聊正在解散
+   */
+  markDissolving(chatId: string): void {
+    this.dissolvingChats.add(chatId);
+    console.log(`[Lifecycle] 标记群 ${chatId} 正在解散`);
+  }
+
+  /**
+   * 检查群聊是否正在解散
+   */
+  isDissolving(chatId: string): boolean {
+    return this.dissolvingChats.has(chatId);
+  }
+
+  /**
+   * 取消解散标记（解散完成后调用）
+   */
+  unmarkDissolving(chatId: string): void {
+    this.dissolvingChats.delete(chatId);
+  }
+
   // 启动时清理无效群
   async cleanUpOnStart(): Promise<void> {
     console.log('[Lifecycle] 正在检查无效群聊...');
@@ -82,12 +107,43 @@ export class LifecycleHandler {
   // 处理用户退群事件
   async handleMemberLeft(chatId: string, memberId: string): Promise<void> {
     console.log(`[Lifecycle] 用户 ${memberId} 退出群 ${chatId}`);
-    await this.checkAndDisbandIfEmpty(chatId);
+    
+    // 如果群正在解散中（我们主动触发的），跳过检查
+    if (this.isDissolving(chatId)) {
+      console.log(`[Lifecycle] 群 ${chatId} 正在解散中，跳过成员退群处理`);
+      return;
+    }
+    
+    // 群解散后会触发退群事件，但群已不存在，无需检查
+    try {
+      await this.checkAndDisbandIfEmpty(chatId);
+    } catch (error) {
+      const errorCode = (error as any)?.response?.data?.code;
+      // 232009: 群已解散, 232011: 操作者不在群里
+      if (errorCode === 232009 || errorCode === 232011) {
+        console.log(`[Lifecycle] 群 ${chatId} 已解散或不可访问，跳过清理`);
+      } else {
+        throw error;
+      }
+    }
   }
 
   // 检查群是否为空，为空则解散
   private async checkAndDisbandIfEmpty(chatId: string, stats?: CleanupStats): Promise<void> {
-    const members = await feishuClient.getChatMembers(chatId);
+    let members: string[];
+    try {
+      members = await feishuClient.getChatMembers(chatId);
+    } catch (error) {
+      const errorCode = (error as any)?.response?.data?.code;
+      // 232009: 群已解散, 232011: 操作者不在群里（用户退群后触发）
+      if (errorCode === 232009 || errorCode === 232011) {
+        console.log(`[Lifecycle] 群 ${chatId} 已解散或操作者已退出，跳过检查`);
+        return;
+      }
+      throw error;
+    }
+
+    console.log(`[Lifecycle] 检查群 ${chatId} 成员数：${members.length}`);
 
     console.log(`[Lifecycle] 检查群 ${chatId} 成员数: ${members.length}`);
 
@@ -156,9 +212,18 @@ export class LifecycleHandler {
     }
 
     // 2. 解散飞书群
-    const disbanded = await feishuClient.disbandChat(chatId);
-    if (disbanded && stats) {
-      stats.disbandedChats += 1;
+    try {
+      const disbanded = await feishuClient.disbandChat(chatId);
+      if (disbanded && stats) {
+        stats.disbandedChats += 1;
+      }
+    } catch (error) {
+      const errorCode = (error as any)?.response?.data?.code;
+      if (errorCode === 232009) {
+        console.log(`[Lifecycle] 群 ${chatId} 已被解散，无需重复操作`);
+      } else {
+        console.error(`[Lifecycle] 解散群 ${chatId} 失败:`, error);
+      }
     }
   }
 }

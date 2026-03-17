@@ -1,9 +1,12 @@
 import { feishuClient, type FeishuMessageEvent, type FeishuCardActionEvent } from '../feishu/client.js';
+import { bitableClient } from '../feishu/bitable-client.js';
 import { opencodeClient } from '../opencode/client.js';
 import { chatSessionStore } from '../store/chat-session.js';
+import { taskStore } from '../store/task-store.js';
 import {
   buildCreateChatCard,
   buildWelcomeCard,
+  buildCreateTaskCard,
   CREATE_CHAT_NEW_SESSION_VALUE,
   type CreateChatCardData,
   type CreateChatSessionOption,
@@ -359,6 +362,20 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     );
   }
 
+  private async pushCreateTaskCard(chatId: string, messageId?: string, openId?: string): Promise<void> {
+    // 与 create_chat 保持一致：用 DirectoryPolicy.listAvailableProjects 合并别名+历史路径
+    const storeKnownDirs = chatSessionStore.getKnownDirectories();
+    const projectOptions = DirectoryPolicy.listAvailableProjects(storeKnownDirs);
+    const workspacePaths = projectOptions.map(p => p.directory);
+    
+    // 获取所有项目列表用于下拉选择
+    const projects = await bitableClient.listAllProjects();
+    const projectNames = projects.map(p => p.name);
+    
+    const card = buildCreateTaskCard({ workspacePaths, projectNames });
+    await feishuClient.sendCard(chatId, card);
+  }
+
   private getPrivateSessionShortId(openId: string): string {
     const normalized = openId.startsWith('ou_') ? openId.slice(3) : openId;
     return normalized.slice(0, 4);
@@ -473,6 +490,12 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     // 3.1 私聊专属建群快捷命令
     if (this.isCreateGroupCommand(trimmedContent)) {
       await this.pushCreateChatCard(chatId, messageId, CREATE_CHAT_NEW_SESSION_VALUE, senderId);
+      return;
+    }
+
+    // 3.2 /create_task：弹出创建任务卡片
+    if (command.type === 'create_task') {
+      await this.pushCreateTaskCard(chatId, messageId, senderId);
       return;
     }
 
@@ -700,6 +723,133 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       console.warn('[P2P] 发送开场控制面板失败:', error);
     }
 
+  }
+
+  /**
+   * 创建任务群完整流程（设计文档 §10.3）
+   */
+  async createTaskGroup(params: {
+    openId: string;
+    taskTitle: string;
+    taskDescription: string | null;
+    projectName: string;
+    workspacePath: string;
+  }): Promise<void> {
+    const { openId, taskTitle, taskDescription, projectName, workspacePath } = params;
+    console.log(`[P2P] 创建任务群: title="${taskTitle}", project="${projectName}", path="${workspacePath}"`);
+
+    // 1. 校验工作目录
+    const dirResult = DirectoryPolicy.resolve({ explicitDirectory: workspacePath });
+    if (!dirResult.ok) {
+      await feishuClient.sendText(openId, `❌ 工作目录无效：${dirResult.userMessage}`);
+      return;
+    }
+    const effectiveDir = dirResult.source === 'server_default' ? undefined : dirResult.directory;
+
+    // 2. 创建飞书群（群名 = 任务名称）
+    const createResult = await feishuClient.createChat(taskTitle, [openId], '任务群');
+    if (!createResult.chatId) {
+      await feishuClient.sendText(openId, '❌ 创建群聊失败，请重试');
+      return;
+    }
+    const newChatId = createResult.chatId;
+    console.log(`[P2P] 任务群已创建，ID: ${newChatId}`);
+
+    // 3. 确认用户在群中
+    const userInGroup = await this.ensureUserInGroup(newChatId, openId, createResult.invalidUserIds);
+    if (!userInGroup.ok) {
+      await feishuClient.disbandChat(newChatId);
+      await feishuClient.sendText(openId, userInGroup.message || '❌ 创建任务群失败，请重试');
+      return;
+    }
+
+    // 4. 在 OpenCode 创建新 Session
+    let session;
+    try {
+      session = await opencodeClient.createSession(`任务: ${taskTitle}`, effectiveDir);
+    } catch (err) {
+      console.error('[P2P] 创建 OpenCode Session 失败:', err);
+      await feishuClient.disbandChat(newChatId);
+      await feishuClient.sendText(openId, '❌ 创建 OpenCode 会话失败，请重试');
+      return;
+    }
+
+    // 5. 绑定群与 Session
+    chatSessionStore.setSession(newChatId, session.id, openId, `任务: ${taskTitle}`, {
+      chatType: 'group',
+      resolvedDirectory: session.directory,
+    });
+    if (session.directory) {
+      chatSessionStore.updateConfig(newChatId, { defaultDirectory: session.directory });
+    }
+    console.log(`[P2P] 已绑定 Session: Chat=${newChatId}, Session=${session.id}`);
+
+    // 5.5 预注册任务群（确保 isTaskChat 立刻生效，不依赖 Bitable 写入结果）
+    taskStore.registerTaskChat(newChatId, {
+      title: taskTitle,
+      description: taskDescription ?? undefined,
+      workspace_path: session.directory || workspacePath,
+      creator_open_id: openId,
+      project_name: projectName,
+    }, session.id);
+
+    // 6. 写入飞书多维表格
+    // 飞书 AppLink 打开群聊的正确参数是 openChatId（官方文档确认）
+    const chatLink = `https://applink.feishu.cn/client/chat/open?openChatId=${newChatId}`;
+    const task = await taskStore.createTask(
+      {
+        title: taskTitle,
+        description: taskDescription ?? undefined,
+        workspace_path: session.directory || workspacePath,
+        creator_open_id: openId,
+        project_name: projectName,
+      },
+      session.id,
+      newChatId,
+    );
+
+    if (task) {
+      console.log(`[P2P] 任务已写入 Bitable: task_id=${task.task_id}`);
+      // 补充写入群聊链接和创建者ID
+      await taskStore.updateTaskFields(newChatId, {
+        chat_link: chatLink,
+        creator_open_id: openId,
+      });
+    } else {
+      console.warn('[P2P] 任务写入 Bitable 失败，任务群仍正常创建');
+    }
+
+    // 7. 群内发第一条消息（任务群专属命令说明）
+    const taskGroupHelp = [
+      `📋 **任务群已创建：${taskTitle}**`,
+      '',
+      '**执行控制**',
+      '  `/todo`                用任务内容启动 AI 执行',
+      '  `/done`                标记任务完成',
+      '  `/cancel`              取消任务',
+      '',
+      '**任务管理**',
+      '  `/task`                显示当前任务内容',
+      '  `/task <新内容>`        修改任务内容',
+      '  `/task_title <新标题>`  修改任务标题',
+      '',
+      '**项目与工作区**',
+      '  `/project`             显示所属项目',
+      '  `/workspace`           显示工作目录',
+      '',
+      '  `/close_chat`          解散任务群（仅已完成任务）',
+    ].join('\n');
+
+    await feishuClient.sendText(newChatId, taskGroupHelp);
+
+    // 8. 发送控制面板
+    try {
+      await commandHandler.pushPanelCard(newChatId);
+    } catch (err) {
+      console.warn('[P2P] 发送任务群控制面板失败:', err);
+    }
+
+    console.log(`[P2P] 任务群创建完成: chat=${newChatId}, session=${session.id}`);
   }
 
   // 处理私聊中的卡片动作

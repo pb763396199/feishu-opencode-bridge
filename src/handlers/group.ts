@@ -7,6 +7,7 @@ import { parseQuestionAnswerText } from '../opencode/question-parser.js';
 import { parseCommand } from '../commands/parser.js';
 import type { EffortLevel } from '../commands/effort.js';
 import { commandHandler } from './command.js';
+import { taskStore } from '../store/task-store.js';
 import { modelConfig, attachmentConfig } from '../config.js';
 import { DirectoryPolicy } from '../utils/directory-policy.js';
 import { buildSessionTimestamp } from '../utils/session-title.js';
@@ -136,7 +137,17 @@ export class GroupHandler {
       return;
     }
 
-    // 2. 检查是否有待回答的问题
+    // 2. 任务群：INBOX/BACKLOG/TODO 状态下拦截非命令消息（设计文档 §10.6）
+    const taskForCheck = await taskStore.getTaskByChatId(chatId);
+    if (taskForCheck && ['INBOX', 'BACKLOG', 'TODO'].includes(taskForCheck.status)) {
+      await feishuClient.reply(
+        messageId,
+        '⚠️ 任务尚未启动，请先发送 `/todo` 开始执行。\n   如需修改任务内容，请使用 `/task <新内容>`'
+      );
+      return;
+    }
+
+    // 3. 检查是否有待回答的问题
     const hasPending = await this.checkPendingQuestion(chatId, trimmed, messageId, attachments);
     if (hasPending) return;
 

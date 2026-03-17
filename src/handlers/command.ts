@@ -10,6 +10,8 @@ import {
   type OpencodeRuntimeConfig,
 } from '../opencode/client.js';
 import { chatSessionStore } from '../store/chat-session.js';
+import { taskStore } from '../store/task-store.js';
+import { taskCommandHandler, type TaskCommand } from '../commands/task-commands.js';
 import { buildControlCard, buildStatusCard } from '../feishu/cards.js';
 import { writeCommandDoc, type CommandDocData } from '../commands/command-doc.js';
 import { modelConfig, userConfig } from '../config.js';
@@ -742,7 +744,7 @@ export class CommandHandler {
     try {
       switch (command.type) {
         case 'help':
-          await feishuClient.reply(messageId, getHelpText());
+          await feishuClient.reply(messageId, getHelpText(taskStore.isTaskChat(chatId)));
           break;
 
         case 'status':
@@ -750,6 +752,23 @@ export class CommandHandler {
           break;
 
         case 'session':
+          if (taskStore.isTaskChat(chatId)) {
+            // 任务群：/session new（无路径）允许，用于重置对话历史
+            // /session new <路径> 和 /session switch 禁止（工作目录不可变，不可切换到其他 Session）
+            if (command.sessionAction === 'switch') {
+              await feishuClient.reply(messageId, '❌ 任务群不支持切换 Session\n\n如需重新开始，请使用 `/session new` 重置对话历史');
+              break;
+            }
+            if (command.sessionAction === 'new' && command.sessionDirectory) {
+              await feishuClient.reply(messageId, '⚠️ 任务群工作目录不可变，不支持指定路径新建 Session\n\n使用 `/session new`（不带路径）可重置对话历史，工作目录保持不变');
+              break;
+            }
+            if (command.sessionAction === 'new') {
+              // 允许：重置对话历史，更新 Bitable session_id，状态回到 INBOX
+              await this.handleTaskChatSessionReset(chatId, messageId, context.senderId);
+              break;
+            }
+          }
           if (command.sessionAction === 'new') {
             await this.handleNewSession(chatId, messageId, context.senderId, context.chatType, command.sessionDirectory, command.sessionName);
           } else if (command.sessionAction === 'switch' && command.sessionId) {
@@ -760,16 +779,17 @@ export class CommandHandler {
           break;
 
         case 'project':
-          if (command.projectAction === 'list') {
+          if (!taskStore.isTaskChat(chatId) && command.projectAction === 'list') {
             await this.handleProjectList(chatId, messageId);
-          } else if (command.projectAction === 'default_set' && command.projectValue) {
+          } else if (!taskStore.isTaskChat(chatId) && command.projectAction === 'default_set' && command.projectValue) {
             await this.handleProjectDefault(chatId, messageId, 'set', command.projectValue);
-          } else if (command.projectAction === 'default_clear') {
+          } else if (!taskStore.isTaskChat(chatId) && command.projectAction === 'default_clear') {
             await this.handleProjectDefault(chatId, messageId, 'clear');
-          } else if (command.projectAction === 'default_show') {
+          } else if (!taskStore.isTaskChat(chatId) && command.projectAction === 'default_show') {
             await this.handleProjectDefaultShow(chatId, messageId);
           } else {
-            await feishuClient.reply(messageId, '用法: /project list 或 /project default set <路径或别名>');
+            // /project 无参数默认视为任务群命令
+            await this.handleTaskCommand(chatId, messageId, context.senderId, 'project_show');
           }
           break;
 
@@ -784,7 +804,7 @@ export class CommandHandler {
           }
           break;
 
-        case 'stop': {
+        case 'stop':
           const sessionId = chatSessionStore.getSessionId(chatId);
           if (sessionId) {
             await opencodeClient.abortSession(sessionId);
@@ -793,7 +813,6 @@ export class CommandHandler {
             await feishuClient.reply(messageId, '当前没有活跃的会话');
           }
           break;
-        }
 
         case 'compact':
           await this.handleCompact(chatId, messageId);
@@ -862,11 +881,68 @@ export class CommandHandler {
           await this.handleRestartCommand(messageId, command.restartTarget);
           break;
 
-        // 其他命令透传
-        default:
-          await this.handlePassthroughCommand(chatId, messageId, command.type.replace(/^\//, ''), command.commandArgs || '');
+        // ===== 任务群专属命令 =====
+        case 'task': {
+          // 根据 taskAction 决定是显示还是设置任务内容
+          const taskCmdType = command.taskAction === 'set' ? 'task_set' : 'task_show';
+          await this.handleTaskCommand(chatId, messageId, context.senderId, taskCmdType, command.taskContent);
           break;
-      }
+        }
+
+        case 'task_title': {
+          // 根据 taskTitleAction 决定是显示还是设置任务标题
+          const titleCmdType = command.taskTitleAction === 'set' ? 'task_title_set' : 'task_title_show';
+          await this.handleTaskCommand(chatId, messageId, context.senderId, titleCmdType, command.taskTitle);
+          break;
+        }
+
+        case 'task_todo':
+          await this.handleTaskCommand(chatId, messageId, context.senderId, 'todo');
+          break;
+
+        case 'task_backlog':
+          await this.handleTaskCommand(chatId, messageId, context.senderId, 'backlog');
+          break;
+
+        case 'task_done':
+          await this.handleTaskCommand(chatId, messageId, context.senderId, 'done');
+          break;
+
+        case 'task_cancel':
+          await this.handleTaskCommand(chatId, messageId, context.senderId, 'cancel');
+          break;
+
+        case 'task_followup':
+          await this.handleTaskCommand(chatId, messageId, context.senderId, 'followup');
+          break;
+
+        case 'task_close_task':
+          await this.handleTaskCommand(chatId, messageId, context.senderId, 'close_task');
+          break;
+
+        case 'whoami':
+          if (!context.senderId) {
+            await feishuClient.reply(messageId, '❌ 无法获取用户 ID，请稍后重试');
+            break;
+          }
+          await feishuClient.reply(messageId, `你的 open_id 是：\`${context.senderId}\`\n可将此 ID 配置到 \`ALLOWED_USERS\` 环境变量`);
+          break;
+
+        case 'workspace': {
+          // workspace 命令在两种群都可用
+          if (command.workspaceAction === 'set' && command.workspacePath) {
+            await this.handleWorkspaceSet(chatId, messageId, context.senderId, command.workspacePath);
+          } else {
+            await this.handleWorkspaceShow(chatId, messageId);
+          }
+          break;
+        }
+
+        default:
+          // 其他命令透传到 OpenCode
+          await this.handlePassthroughCommand(chatId, messageId, command.type.replace(/^\//, ''), command.commandArgs || command.commandPrefix || '/');
+          break;
+        }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       console.error('[Command] 执行失败详情:', errorMessage);
@@ -952,6 +1028,36 @@ export class CommandHandler {
     await feishuClient.reply(messageId, formatRestartResultText(result));
   }
 
+  private async handleTaskCommand(
+    chatId: string,
+    messageId: string,
+    senderId: string,
+    commandType: TaskCommand,
+    args?: string
+  ): Promise<void> {
+    // 检查是否为任务群
+    const isTaskChat = taskStore.isTaskChat(chatId);
+
+    // 如果不是任务群，提示错误（任务群专属命令）
+    if (!isTaskChat) {
+      await feishuClient.reply(messageId, '❌ 当前群不是任务群，无法执行任务命令');
+      return;
+    }
+
+    const result = await taskCommandHandler.handle(commandType, {
+      chatId,
+      messageId,
+      senderId,
+      args,
+    });
+
+    if (result.card) {
+      await feishuClient.replyCard(messageId, result.card);
+    } else if (result.message) {
+      await feishuClient.reply(messageId, result.message);
+    }
+  }
+
   private async handleStatus(chatId: string, messageId: string): Promise<void> {
     const sessionId = chatSessionStore.getSessionId(chatId);
     // 这里简单返回文本，或者用 StatusCard
@@ -964,6 +1070,61 @@ export class CommandHandler {
     }
 
     await feishuClient.reply(messageId, `🤖 **OpenCode 状态**\n\n${status}\n${extra}`);
+  }
+
+  /**
+   * 任务群 /session new：重置对话历史
+   * - 在 OpenCode 创建新 Session（工作目录不变）
+   * - 更新 chatSessionStore 和 Bitable 的 opencode_session_id
+   * - 任务状态重置为 INBOX
+   */
+  private async handleTaskChatSessionReset(
+    chatId: string,
+    messageId: string,
+    userId: string,
+  ): Promise<void> {
+    const task = await taskStore.getTaskByChatId(chatId);
+    if (!task) {
+      await feishuClient.reply(messageId, '❌ 未找到任务信息');
+      return;
+    }
+
+    // 检查权限：只有创建者可以重置
+    if (task.creator_open_id && task.creator_open_id !== userId) {
+      await feishuClient.reply(messageId, '❌ 仅任务创建者可以重置对话历史');
+      return;
+    }
+
+    try {
+      // 1. 在 OpenCode 创建新 Session（使用相同工作目录）
+      const title = `任务: ${task.title}`;
+      const session = await opencodeClient.createSession(title, task.workspace_path || undefined);
+      if (!session) {
+        await feishuClient.reply(messageId, '❌ 创建新会话失败，请重试');
+        return;
+      }
+
+      // 2. 更新 chatSessionStore 绑定
+      chatSessionStore.setSession(chatId, session.id, userId, title, {
+        chatType: 'group',
+        resolvedDirectory: session.directory,
+      });
+
+      // 3. 更新 Bitable 的 session_id 字段
+      await taskStore.updateTaskFields(chatId, {
+        opencode_session_id: session.id,
+      });
+      // 4. 任务状态重置为 INBOX
+      await taskStore.updateTaskStatus(chatId, 'INBOX');
+
+      await feishuClient.reply(
+        messageId,
+        `⚠️ 对话历史已重置，新 Session 已创建\n\nID: ${session.id}\n📂 工作目录: ${session.directory || task.workspace_path}\n\n任务状态已重置为「待分类」，使用 \`/todo\` 重新开始执行`
+      );
+    } catch (error) {
+      console.error('[Command] 任务群 Session 重置失败:', error);
+      await feishuClient.reply(messageId, '❌ 重置失败，请重试');
+    }
   }
 
   private async handleNewSession(
@@ -1093,6 +1254,79 @@ export class CommandHandler {
       await feishuClient.reply(messageId, `当前群默认项目: ${chatDefault}\n使用 \`/project default clear\` 清除`);
     } else {
       await feishuClient.reply(messageId, '当前群未设置默认项目（跟随全局默认）\n使用 \`/project default set <路径或别名>\` 设置');
+    }
+  }
+
+  /**
+   * 显示当前工作目录（两种群都可用）
+   */
+  private async handleWorkspaceShow(chatId: string, messageId: string): Promise<void> {
+    // 检查是否是任务群
+    const task = await taskStore.getTaskByChatId(chatId);
+    if (task) {
+      // 任务群：显示任务的工作目录
+      await feishuClient.reply(messageId, `📂 **工作目录**: ${task.workspace_path}\n\n（只读，创建任务时确定）`);
+      return;
+    }
+
+    // 聊天群：显示当前会话的工作目录
+    const session = chatSessionStore.getSession(chatId);
+    if (session?.resolvedDirectory) {
+      await feishuClient.reply(messageId, `📂 **工作目录**: ${session.resolvedDirectory}\n\n当前绑定 Session: ${session.sessionId}`);
+    } else {
+      await feishuClient.reply(messageId, '📂 **工作目录**: 未设置\n\n使用 `/workspace <路径>` 设置工作目录');
+    }
+  }
+
+  /**
+   * 设置工作目录（两种群都可用）
+   * 类似 main 分支的 /project 行为，设置后会新建 session
+   */
+  private async handleWorkspaceSet(
+    chatId: string,
+    messageId: string,
+    userId: string,
+    workspacePath: string
+  ): Promise<void> {
+    // 使用 DirectoryPolicy 解析路径
+    const isAbsolute = path.isAbsolute(workspacePath);
+    const explicitDirectory = isAbsolute ? workspacePath : undefined;
+    const aliasName = !isAbsolute ? workspacePath : undefined;
+
+    const dirResult = DirectoryPolicy.resolve({
+      explicitDirectory,
+      aliasName,
+      chatDefaultDirectory: chatSessionStore.getSession(chatId)?.defaultDirectory,
+    });
+
+    if (!dirResult.ok) {
+      await feishuClient.reply(messageId, `❌ ${dirResult.userMessage}`);
+      return;
+    }
+
+    // 创建新 session（类似 main 分支的 /project 行为）
+    try {
+      const title = this.buildSessionTitle('group', userId);
+      const session = await opencodeClient.createSession(title, dirResult.directory);
+
+      if (session) {
+        chatSessionStore.setSession(chatId, session.id, userId, title, {
+          chatType: 'group',
+          resolvedDirectory: session.directory,
+          projectName: dirResult.projectName,
+        });
+
+        const projectLabel = dirResult.projectName ? `\n📁 项目: ${dirResult.projectName}` : '';
+        await feishuClient.reply(
+          messageId,
+          `✅ 已设置工作目录并创建新会话\n📂 工作目录: ${session.directory}${projectLabel}\nID: ${session.id}`
+        );
+      } else {
+        await feishuClient.reply(messageId, '❌ 创建会话失败，请检查目录是否有效');
+      }
+    } catch (error) {
+      console.error('[Command] 设置工作目录失败:', error);
+      await feishuClient.reply(messageId, '❌ 设置工作目录失败，请检查目录是否为有效的代码仓库');
     }
   }
 
