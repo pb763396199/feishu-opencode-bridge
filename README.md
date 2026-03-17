@@ -88,7 +88,7 @@
 | Shell 命令透传 | 白名单 `!` 命令通过 OpenCode shell 执行并回显输出 | `!ls`、`!pwd`、`!git status` |
 | 服务端鉴权兼容 | 支持 OpenCode Server Basic Auth，不怕后续默认强制密码 | `OPENCODE_SERVER_USERNAME`、`OPENCODE_SERVER_PASSWORD` |
 | 文件发送到飞书 | AI 可将电脑上的文件/截图直接发送到当前飞书群聊 | `/send`、`发送文件` |
-| 工作目录/项目管理 | 创建会话时指定工作目录，支持项目别名、群默认项目、9 阶段安全校验 | `/project list`、`/session new <别名>`、`ALLOWED_DIRECTORIES` |
+| 工作目录/项目管理 | 查看和设置工作目录，支持项目别名、群默认项目、9 阶段安全校验 | `/workspace`、`/workspace <路径>`、`/project list`、`/project default set <路径或别名>`、`ALLOWED_DIRECTORIES` |
 | OpenCode 本地可靠性治理 | 运行时 Cron（API/命令/自然语言）+ 本地宕机自动救援（含配置备份/两级回退）+ 可选主动心跳 | `HEARTBEAT.md`、`RELIABILITY_*`、`logs/reliability-audit.jsonl` |
 | 部署运维闭环 | 提供部署/升级/检查/后台/systemd 的一体化入口 | `scripts/deploy.*`、`scripts/start.*` |
 
@@ -847,6 +847,8 @@ npm test -- tests/reliability-rescue.e2e.test.ts
 | `/project default` | 查看当前群默认项目 |
 | `/project default set <路径或别名>` | 设置当前群的默认工作项目 |
 | `/project default clear` | 清除当前群默认项目 |
+| `/workspace` | 查看当前工作目录（任务群/聊天群都可用） |
+| `/workspace <路径>` | 设置工作目录并新建会话（支持绝对路径或项目别名） |
 | `/session <sessionId>` | 手动绑定已有 OpenCode 会话（支持 Web 端创建的跨工作区会话；需启用 `ENABLE_MANUAL_SESSION_BIND`） |
 | `新建会话窗口` | 自然语言触发新建会话（等价 `/session new`） |
 | `/clear` | 等价于 `/session new` |
@@ -859,6 +861,21 @@ npm test -- tests/reliability-rescue.e2e.test.ts
 | `/send <绝对路径>` | 发送指定路径的文件到当前群聊 |
 | `/restart opencode` | 重启本地 OpenCode 进程（仅 loopback） |
 | `/status` | 查看当前群绑定状态 |
+
+### 任务群专属命令（仅在任务群中可用）
+
+| 命令 | 说明 |
+|---|---|
+| `/task` | 查看当前任务内容 |
+| `/task <内容>` | 修改任务内容 |
+| `/task_title` | 查看任务标题 |
+| `/task_title <标题>` | 修改任务标题（同步修改群名） |
+| `/project` | 查看任务所属项目名称 |
+| `/todo` | 标记任务为待执行（启动任务） |
+| `/backlog` | 将任务移至待规划 |
+| `/done` | 标记任务完成 |
+| `/cancel` | 取消任务 |
+| `/close_task` | 解散任务群 |
 
 Discord 侧推荐命令（优先 `///` 前缀，避免与原生 Slash 冲突）：
 | 命令 | 说明 |
