@@ -6,16 +6,13 @@ export interface Task {
   title: string;
   status: TaskStatus;
   priority: TaskPriority;
-  health: 'GREEN' | 'YELLOW' | 'RED';
   blocked_reason: BlockedReason | null;
-  assignee: string;  // 飞书用户 open_id
-  topic: TaskTopic | null;
+  execution_agent: string;
   
   // B. 行动与跳转
   chat_link: string;
   description: string | null;
   workspace_path: string;
-  working_branch: string | null;
   
   // C. 时间与节奏
   started_at: Date | null;
@@ -24,13 +21,10 @@ export interface Task {
   closed_at: Date | null;
   status_updated_at: Date;
   unblocked_at: Date | null;
-  blocked_history: string | null;  // JSON 数组字符串
-  followup_task_id: string | null;
   updated_at: Date;
   
   // D. 交付物
   deliverable_summary: string | null;
-  deliverable_md: string | null;
   
   // E. 系统与快照（隐藏）
   task_id: string;
@@ -38,23 +32,17 @@ export interface Task {
   chat_id: string;
   opencode_session_id: string;
   creator_open_id: string;
-  sync_last_message_id: string | null;
-  sync_last_push_at: Date | null;
-  git_diffstat: string | null;
-  files_changed: number | null;
-  insertions: number | null;
-  deletions: number | null;
-  git_commits: string | null;
-  git_base_commit: string | null;
-  hidden: boolean;
+  archived: boolean;
   archived_at: Date | null;
-  failure_step: string | null;
 }
 
 export interface Project {
   project_id: string;
   name: string;
   repo_url: string | null;
+  task_table_id: string | null;           // P2: 该项目专属任务表的 table_id
+  default_execution_agent: string | null; // P2: 该项目任务的默认执行 Agent
+  workspace_paths: string[] | null;       // P2: 该项目可用的工作目录列表
   created_at: Date;
   updated_at: Date;
 }
@@ -64,13 +52,15 @@ export interface CreateTaskInput {
   description?: string;
   workspace_path: string;
   creator_open_id: string;
+  project_id?: string;
   project_name?: string;
+  execution_agent?: string;  // P2-A: 允许显式指定执行Agent（覆盖项目配置）
 }
 
 export interface TaskFilter {
   status?: TaskStatus[];
   priority?: TaskPriority[];
-  hidden?: boolean;
+  archived?: boolean;
   project_id?: string;
   creator_open_id?: string;
 }

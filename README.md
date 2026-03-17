@@ -847,8 +847,8 @@ npm test -- tests/reliability-rescue.e2e.test.ts
 | `/project default` | 查看当前群默认项目 |
 | `/project default set <路径或别名>` | 设置当前群的默认工作项目 |
 | `/project default clear` | 清除当前群默认项目 |
-| `/workspace` | 查看当前工作目录（任务群/聊天群都可用） |
-| `/workspace <路径>` | 设置工作目录并新建会话（支持绝对路径或项目别名） |
+| `/workspace` | 查看当前工作目录；在任务群中显示任务执行工作空间（只读） |
+| `/workspace <路径>` | 在聊天群/私聊中设置工作目录并新建会话（支持绝对路径或项目别名） |
 | `/session <sessionId>` | 手动绑定已有 OpenCode 会话（支持 Web 端创建的跨工作区会话；需启用 `ENABLE_MANUAL_SESSION_BIND`） |
 | `新建会话窗口` | 自然语言触发新建会话（等价 `/session new`） |
 | `/clear` | 等价于 `/session new` |
@@ -857,7 +857,8 @@ npm test -- tests/reliability-rescue.e2e.test.ts
 | `/compact` | 调用 OpenCode summarize，压缩当前会话上下文 |
 | `!<shell命令>` | 透传白名单 shell 命令（如 `!ls`、`!pwd`、`!mkdir`、`!git status`） |
 | `//<命令名>` | 透传命名空间 slash 命令（如 `//superpowers:brainstorming`） |
-| `/create_chat` / `/建群` | 私聊中调出建群卡片（下拉选择后点击"创建群聊"生效） |
+| `/create_task` | 私聊中调出创建任务群卡片（推荐入口） |
+| `/create_chat` / `/建群` | 私聊中调出创建任务群卡片（兼容入口） |
 | `/send <绝对路径>` | 发送指定路径的文件到当前群聊 |
 | `/restart opencode` | 重启本地 OpenCode 进程（仅 loopback） |
 | `/status` | 查看当前群绑定状态 |
@@ -870,12 +871,25 @@ npm test -- tests/reliability-rescue.e2e.test.ts
 | `/task <内容>` | 修改任务内容 |
 | `/task_title` | 查看任务标题 |
 | `/task_title <标题>` | 修改任务标题（同步修改群名） |
+| `/priority` | 查看任务优先级 |
+| `/priority <urgent\|high\|medium\|low>` | 修改任务优先级 |
 | `/project` | 查看任务所属项目名称 |
-| `/todo` | 标记任务为待执行（启动任务） |
-| `/backlog` | 将任务移至待规划 |
-| `/done` | 标记任务完成 |
-| `/cancel` | 取消任务 |
-| `/close_task` | 解散任务群 |
+| `/do` | 标记任务为待执行并启动 AI 执行（仅 To Do 可执行） |
+| `/done` | 标记任务完成（仅创建者可执行，且需在 In Review 状态） |
+| `/cancel` | 取消任务（仅创建者可执行） |
+| `/archive` | 归档当前任务（仅创建者可执行，且仅限 Done 或 Cancelled 状态） |
+| `/archived` | 查看当前项目下我创建的已归档任务 |
+| `/close` | 解散任务群（仅创建者可执行，且仅限 Done 或 Cancelled 状态） |
+
+补充说明：
+- 私聊 `/help` 会显示最完整命令表；普通群 `/help` 不显示私聊独有的创建任务群入口。
+- `/create_task` 是创建任务群的推荐入口；`/create_chat` 和 `/建群` 是兼容入口。
+- `/board` 可在私聊和任务群中使用，用于查看项目总表、全局任务表，以及当前项目任务表链接（如存在）。
+- 任务群中 `/session new` 只用于重置当前对话历史，不支持切换到其他 session，也不支持指定路径新建 session。
+- 任务群中的 `/workspace` 为只读展示；任务执行工作空间在创建任务时确定，不能在任务群内改写。
+- `/create_chat` 创建任务时，若选择了项目，系统会优先把任务路由到该项目的专属任务表。
+- 项目任务表采用延迟创建：首次给项目创建任务时按需建表；若上次建表成功但 `task_table_id` 回写失败，后续会优先复用同名已有任务表，避免重复建表。
+- 项目可配置多个工作目录，任务创建交互遵循“先选项目，再选执行工作目录”。
 
 Discord 侧推荐命令（优先 `///` 前缀，避免与原生 Slash 冲突）：
 | 命令 | 说明 |

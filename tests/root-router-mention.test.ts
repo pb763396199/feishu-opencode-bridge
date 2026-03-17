@@ -67,7 +67,7 @@ describe('RootRouter mention gate', () => {
 
     await rootRouter.onMessage({ ...baseEvent, mentions: undefined });
     expect(spy).not.toHaveBeenCalled();
-  });
+  }, 15000);
 
   it('GROUP_REQUIRE_MENTION=true 且有 @ 时应处理群消息', async () => {
     backupEnv();

@@ -9,8 +9,10 @@ import { chatSessionStore } from '../store/chat-session.js';
 import {
   TASK_FIELDS,
   TASK_STATUS_LABELS,
+  TASK_PRIORITY_LABELS,
   type TaskStatus,
   type BlockedReason,
+  type TaskPriority,
 } from '../config/bitable-fields.js';
 import type { Task } from '../types/task.js';
 
@@ -20,11 +22,15 @@ export type TaskCommand =
   | 'task_set'
   | 'task_title_show'
   | 'task_title_set'
+  | 'priority_show'
+  | 'priority_set'
   | 'project_show'
   | 'workspace_show'
   | 'do'
   | 'done'
   | 'cancel'
+  | 'archive'
+  | 'archived_show'
   | 'followup'
   | 'close';
 
@@ -64,6 +70,12 @@ class TaskCommandHandler {
       case 'task_title_set':
         return this.handleTaskTitleSet(task, context.args || '', context.chatId);
 
+      case 'priority_show':
+        return this.handlePriorityShow(task);
+
+      case 'priority_set':
+        return this.handlePrioritySet(task, context.args || '', context.chatId);
+
       case 'project_show':
         return this.handleProjectShow(task);
 
@@ -78,6 +90,12 @@ class TaskCommandHandler {
 
       case 'cancel':
         return this.handleCancel(task, context.senderId);
+
+      case 'archive':
+        return this.handleArchive(task, context.chatId, context.senderId);
+
+      case 'archived_show':
+        return this.handleArchivedShow(task, context.senderId);
 
       case 'followup':
         return this.handleFollowup(task, context.senderId);
@@ -172,6 +190,47 @@ class TaskCommandHandler {
     return { success: false, message: '❌ 更新任务标题失败' };
   }
 
+  private handlePriorityShow(task: Task | null): TaskCommandResult {
+    if (!task) {
+      return { success: false, message: '当前群不是任务群' };
+    }
+
+    const priorityLabel = TASK_PRIORITY_LABELS[task.priority as keyof typeof TASK_PRIORITY_LABELS] ?? task.priority;
+    return {
+      success: true,
+      message: `⚡ **当前优先级**: ${priorityLabel}\n\n使用 \`/priority <urgent|high|medium|low>\` 修改`,
+    };
+  }
+
+  private async handlePrioritySet(task: Task | null, nextPriorityRaw: string, chatId: string): Promise<TaskCommandResult> {
+    if (!task) {
+      return { success: false, message: '当前群不是任务群' };
+    }
+
+    const normalized = nextPriorityRaw.trim().toLowerCase();
+    const allowedPriorities: TaskPriority[] = ['urgent', 'high', 'medium', 'low'];
+    if (!allowedPriorities.includes(normalized as TaskPriority)) {
+      return {
+        success: false,
+        message: '用法: /priority <urgent|high|medium|low>',
+      };
+    }
+
+    const nextPriority = normalized as TaskPriority;
+    const success = await taskStore.updateTaskFields(chatId, {
+      priority: nextPriority,
+    });
+    if (!success) {
+      return { success: false, message: '❌ 更新任务优先级失败' };
+    }
+
+    const priorityLabel = TASK_PRIORITY_LABELS[nextPriority];
+    return {
+      success: true,
+      message: `✅ 已更新任务优先级为: ${priorityLabel}`,
+    };
+  }
+
   private async handleProjectShow(task: Task | null): Promise<TaskCommandResult> {
     if (!task) {
       return { success: false, message: '当前群不是任务群' };
@@ -214,7 +273,7 @@ class TaskCommandHandler {
 
     return {
       success: true,
-      message: `📂 **工作目录**: ${task.workspace_path}\n\n（只读，创建任务时确定）`,
+      message: `📂 **执行工作空间**: ${task.workspace_path}\n\n（只读，创建任务时确定）`,
     };
   }
 
@@ -268,8 +327,14 @@ class TaskCommandHandler {
       };
     }
 
+    const normalizedExecutionAgent = task.execution_agent.trim();
+
     // 异步发送给 Opencode（不 await，让确认消息先发出）
-    opencodeClient.sendMessage(session.sessionId, description)
+    const sendPromise = normalizedExecutionAgent && normalizedExecutionAgent !== 'default'
+      ? opencodeClient.sendMessage(session.sessionId, description, { agent: normalizedExecutionAgent })
+      : opencodeClient.sendMessage(session.sessionId, description);
+
+    sendPromise
       .then(() => console.log(`[TaskCommand] /do 已将任务描述发给 OpenCode: session=${session.sessionId}`))
       .catch(err => console.error('[TaskCommand] 发送任务描述到 OpenCode 失败:', err));
 
@@ -360,7 +425,7 @@ class TaskCommandHandler {
     try {
       await feishuClient.sendText(
         senderId,
-        `📋 请在此私聊中发送 \`/create_task\` 创建续集任务。\n\n建议继承以下信息：\n- **项目**: ${task.project_id || '未设置'}\n- **工作目录**: ${task.workspace_path || '未设置'}\n- **基于**: ${task.title}`
+        `📋 请在此私聊中发送 \`/create_task\` 创建续集任务。\n\n建议继承以下信息：\n- **项目**: ${task.project_id || '未设置'}\n- **执行工作空间**: ${task.workspace_path || '未设置'}\n- **基于**: ${task.title}`
       );
     } catch (err) {
       console.warn('[TaskCommand] 发送续集任务提示失败:', err);
@@ -369,6 +434,93 @@ class TaskCommandHandler {
     return {
       success: true,
       message: '📬 已在私聊中发送续集任务创建提示',
+    };
+  }
+
+  private async handleArchive(task: Task | null, chatId: string, senderId: string): Promise<TaskCommandResult> {
+    if (!task) {
+      return { success: false, message: '当前群不是任务群' };
+    }
+
+    if (task.creator_open_id !== senderId) {
+      return { success: false, message: '❌ 仅任务创建者可以执行此操作' };
+    }
+
+    if (task.archived) {
+      return { success: false, message: '⚠️ 任务已归档，无需重复操作' };
+    }
+
+    if (!['DONE', 'CANCELLED'].includes(task.status)) {
+      return {
+        success: false,
+        message: '⚠️ 仅已完成或已取消任务可归档',
+      };
+    }
+
+    const success = await taskStore.updateTaskFields(chatId, {
+      archived: true,
+      archived_at: Date.now(),
+    });
+    if (!success) {
+      return {
+        success: false,
+        message: '❌ 归档失败，请稍后重试',
+      };
+    }
+
+    return {
+      success: true,
+      message: '📦 任务已归档，可使用 /close 解散任务群',
+    };
+  }
+
+  private async handleArchivedShow(task: Task | null, senderId: string): Promise<TaskCommandResult> {
+    if (!task) {
+      return { success: false, message: '当前群不是任务群' };
+    }
+
+    const archivedTasks = await taskStore.listTasks({
+      archived: true,
+      creator_open_id: senderId,
+      ...(task.project_id ? { project_id: task.project_id } : {}),
+    });
+    const visibleTasks = archivedTasks
+      .filter(item => item.creator_open_id === senderId)
+      .filter(item => !task.project_id || item.project_id === task.project_id)
+      .sort((left, right) => {
+        const leftTime = left.archived_at?.getTime() ?? left.updated_at.getTime();
+        const rightTime = right.archived_at?.getTime() ?? right.updated_at.getTime();
+        return rightTime - leftTime;
+      })
+      .slice(0, 10);
+
+    if (visibleTasks.length === 0) {
+      return {
+        success: true,
+        message: '📦 暂无已归档任务',
+      };
+    }
+
+    const lines = visibleTasks.map((item, index) => {
+      const archivedAt = item.archived_at ?? item.updated_at;
+      const archivedDate = Number.isNaN(archivedAt.getTime())
+        ? '未知时间'
+        : archivedAt.toLocaleString('zh-CN', {
+            hour12: false,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+          });
+      const linkOrChat = item.chat_link || item.chat_id;
+      const statusLabel = TASK_STATUS_LABELS[item.status as keyof typeof TASK_STATUS_LABELS] ?? item.status;
+      return `${index + 1}. ${item.title}（${statusLabel}，归档于 ${archivedDate}）\n   ${linkOrChat}`;
+    });
+
+    return {
+      success: true,
+      message: `📦 **已归档任务**\n\n${lines.join('\n')}`,
     };
   }
 
@@ -426,9 +578,26 @@ class TaskCommandHandler {
   buildTaskInfoCard(task: Task): Record<string, unknown> {
     const isExecutable = task.status === 'TODO';
     const statusLabel = TASK_STATUS_LABELS[task.status as keyof typeof TASK_STATUS_LABELS] ?? task.status;
+    const priorityLabel = TASK_PRIORITY_LABELS[task.priority as keyof typeof TASK_PRIORITY_LABELS] ?? task.priority;
     const desc = task.description
       ? task.description.slice(0, 300) + (task.description.length > 300 ? '...' : '')
       : '（未设置任务内容，使用 `/task <内容>` 填写）';
+
+    const detailLines = [
+      `**执行 Agent**：${task.execution_agent || 'default'}`,
+    ];
+
+    if (task.status === 'BLOCKED' && task.blocked_reason) {
+      const blockedReasonMap: Record<BlockedReason, string> = {
+        question_asked: '等待回答',
+        permission_asked: '等待授权',
+      };
+      detailLines.push(`**阻塞原因**：${blockedReasonMap[task.blocked_reason]}`);
+    }
+
+    if (task.deliverable_summary) {
+      detailLines.push(`**交付摘要**：${task.deliverable_summary}`);
+    }
 
     return {
       config: { wide_screen_mode: true },
@@ -445,12 +614,16 @@ class TaskCommandHandler {
           tag: 'div',
           fields: [
             { is_short: true, text: { tag: 'lark_md', content: `**状态**：${statusLabel}` } },
-            { is_short: true, text: { tag: 'lark_md', content: `**优先级**：${task.priority}` } },
+            { is_short: true, text: { tag: 'lark_md', content: `**优先级**：${priorityLabel}` } },
           ],
         },
         {
           tag: 'div',
-          text: { tag: 'lark_md', content: `**工作目录**：${task.workspace_path}` },
+          text: { tag: 'lark_md', content: `**执行工作空间**：${task.workspace_path}` },
+        },
+        {
+          tag: 'div',
+          text: { tag: 'lark_md', content: detailLines.join('\n') },
         },
         { tag: 'hr' },
         {
@@ -578,7 +751,7 @@ class TaskCommandHandler {
           tag: 'div',
           text: {
             tag: 'lark_md',
-            content: `**确认后：**\n• 任务状态将变为已取消\n• 任务将在看板中隐藏${extraNote}\n• 之后可使用 \`/close\` 解散任务群`,
+            content: `**确认后：**\n• 任务状态将变为已取消\n• 任务默认仍保留在当前看板，可稍后使用 \`/archive\` 手动归档${extraNote}\n• 之后可使用 \`/close\` 解散任务群`,
           },
         },
         {

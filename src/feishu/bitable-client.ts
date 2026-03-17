@@ -13,6 +13,7 @@ import {
   type TaskPriority,
 } from '../config/bitable-fields.js';
 import type { Task, Project, CreateTaskInput, TaskFilter } from '../types/task.js';
+import { ensureTaskTableViews } from './task-table-views.js';
 
 interface BitableConfig {
   appToken: string;
@@ -136,6 +137,10 @@ class BitableClient {
     console.log(`[Bitable] 已配置多维表格: app=${tokenPreview}`);
   }
 
+  getConfig(): BitableConfig | null {
+    return this.config;
+  }
+
   private ensureConfig(): BitableConfig {
     if (!this.config) {
       throw new Error('Bitable 未配置，请先调用 configure()');
@@ -207,6 +212,276 @@ class BitableClient {
     return this.createProject(name, repoUrl);
   }
 
+  private getProjectTaskTableName(projectName: string): string {
+    return `${projectName}任务`;
+  }
+
+  private buildBitableTableUrl(appToken: string, tableId: string): string {
+    return `https://feishu.cn/base/${appToken}?table=${tableId}`;
+  }
+
+  private parseUrlFieldLink(value: unknown): string | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return null;
+    }
+
+    const link = (value as Record<string, unknown>).link;
+    if (typeof link !== 'string') {
+      return null;
+    }
+
+    const normalized = link.trim();
+    return normalized || null;
+  }
+
+  private isValidTableId(tableId: string | null): tableId is string {
+    return typeof tableId === 'string' && /^tbl[a-zA-Z0-9]+$/.test(tableId);
+  }
+
+  private parseTaskTableId(value: string | null): string | null {
+    if (!value) {
+      return null;
+    }
+
+    const normalized = value.trim();
+    if (!normalized) {
+      return null;
+    }
+
+    try {
+      const url = new URL(normalized);
+      const tableId = url.searchParams.get('table')?.trim();
+      if (tableId) {
+        return tableId;
+      }
+    } catch {
+      // 非 URL，按原始 table_id 处理
+    }
+
+    return this.isValidTableId(normalized) ? normalized : null;
+  }
+
+  private async persistProjectTaskTableId(projectId: string, taskTableId: string): Promise<boolean> {
+    const config = this.ensureConfig();
+    const taskTableLink = this.buildBitableTableUrl(config.appToken, taskTableId);
+    const updateResult = await this.apiFetch(
+      `/bitable/v1/apps/${config.appToken}/tables/${config.projectTableId}/records/${projectId}?user_id_type=open_id`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({
+          fields: {
+            [PROJECT_FIELDS.task_table_id]: taskTableLink,
+            [PROJECT_FIELDS.updated_at]: Date.now(),
+          },
+        }),
+      }
+    );
+
+    if ((updateResult.code as number) !== 0) {
+      console.error(`[Bitable] 更新项目任务表ID失败: ${updateResult.msg}`);
+      return false;
+    }
+
+    console.log(`[Bitable] 项目任务表ID已持久化: ${taskTableId}`);
+    return true;
+  }
+
+  private async findReusableProjectTaskTable(projectName: string): Promise<string | null> {
+    const config = this.ensureConfig();
+    const expectedTableName = this.getProjectTaskTableName(projectName);
+    const tables = await this.listTables(config.appToken);
+    const matchedTable = tables.find(table => table.name === expectedTableName);
+    return matchedTable?.table_id ?? null;
+  }
+
+  /**
+   * P2: 为项目创建专属任务表（惰性创建）
+   * 创建成功后会更新项目记录的 task_table_id 字段
+   */
+  async createProjectTaskTable(projectId: string, projectName: string): Promise<string | null> {
+    const config = this.ensureConfig();
+    try {
+      const existingTableId = await this.findReusableProjectTaskTable(projectName);
+      if (existingTableId) {
+        console.log(`[Bitable] 项目 "${projectName}" 复用已有任务表: ${existingTableId}`);
+        const persisted = await this.persistProjectTaskTableId(projectId, existingTableId);
+        return persisted ? existingTableId : null;
+      }
+
+      // 1. 创建任务表，使用项目名作为表名
+      const tableName = this.getProjectTaskTableName(projectName);
+      const taskTable = await this.createTable(config.appToken, tableName, [
+        { field_name: TASK_FIELDS.title, type: 1 },
+        {
+          field_name: TASK_FIELDS.status, type: 3,
+          property: { options: Object.values(TASK_STATUS_LABELS).map((name, i) => ({ name, color: i })) },
+        },
+        {
+          field_name: TASK_FIELDS.priority, type: 3,
+          property: { options: Object.values(TASK_PRIORITY_LABELS).map((name, i) => ({ name, color: i })) },
+        },
+        {
+          field_name: TASK_FIELDS.blocked_reason, type: 3,
+          property: { options: Object.values(BLOCKED_REASON_LABELS).map((name, i) => ({ name, color: i })) },
+        },
+      ]);
+
+      if (!taskTable) {
+        console.error(`[Bitable] 为项目 "${projectName}" 创建任务表失败`);
+        return null;
+      }
+
+      const taskTableId = taskTable.table_id;
+      console.log(`[Bitable] 项目 "${projectName}" 任务表已创建: ${taskTableId}`);
+
+      // 2. 补充创建所有任务字段
+      const existingFields = new Set(await this.listFields(config.appToken, taskTableId));
+      const taskFieldDefs = this.getProjectTaskFieldDefinitions();
+
+      for (const f of taskFieldDefs) {
+        if (existingFields.has(f.field_name)) continue;
+        await this.createField(config.appToken, taskTableId, f.field_name, f.type, f.property);
+        await new Promise(r => setTimeout(r, 150)); // 避免QPS限制
+      }
+
+      await ensureTaskTableViews(this, config.appToken, taskTableId);
+
+      // 4. 更新项目记录的 task_table_id（写回失败视为真实失败，但后续调用会优先复用已有表）
+      const persisted = await this.persistProjectTaskTableId(projectId, taskTableId);
+      if (!persisted) {
+        // P2-A: task_table_id 写回失败是真实失败，返回 null 触发 fallback 到全局表
+        // 但下次会优先复用已存在的同名项目表，避免重复创建孤儿表
+        return null;
+      }
+
+      console.log(`[Bitable] 项目 "${projectName}" 任务表已完成绑定: ${taskTableId}`);
+      return taskTableId;
+    } catch (error) {
+      console.error('[Bitable] 创建项目任务表异常:', error);
+      return null;
+    }
+  }
+
+  /**
+   * P2-A: 获取或创建项目的专属任务表（带 fallback 语义）
+   *
+   * Fallback 语义：
+   * 1. 项目已有 task_table_id → 返回该 ID（路由到项目专属表）
+   * 2. 无 task_table_id 但已存在同名专属表 → 优先复用并尝试回填
+   * 3. 无 task_table_id 且惰性创建成功 → 返回新表 ID（路由到项目专属表）
+   * 4. 无 task_table_id 且专属表最终不可用 → 返回 null（fallback 到全局任务表）
+   *
+   * 注意：createProjectTaskTable 的写回失败仍被视为真实失败，会返回 null
+   * 触发 fallback；但后续调用会先查找并复用同名表，避免重复创建孤儿表。
+   */
+  async getOrCreateProjectTaskTable(project: Project): Promise<string | null> {
+    // 已有任务表ID，直接返回
+    if (this.isValidTableId(project.task_table_id)) {
+      return project.task_table_id;
+    }
+
+    if (project.task_table_id) {
+      console.warn(`[Bitable] 项目 "${project.name}" 任务表标识无效，将尝试重新发现或回退: ${project.task_table_id}`);
+    }
+
+    const reusableTableId = await this.findReusableProjectTaskTable(project.name);
+    if (reusableTableId) {
+      console.log(`[Bitable] 项目 "${project.name}" 检测到可复用任务表: ${reusableTableId}`);
+      const persisted = await this.persistProjectTaskTableId(project.project_id, reusableTableId);
+      if (persisted) {
+        return reusableTableId;
+      }
+      console.warn(`[Bitable] 项目 "${project.name}" 已找到可复用任务表，但写回失败，将 fallback 到全局表`);
+      return null;
+    }
+
+    // 惰性创建
+    console.log(`[Bitable] 项目 "${project.name}" 无专属任务表，开始惰性创建...`);
+    const tableId = await this.createProjectTaskTable(project.project_id, project.name);
+
+    if (tableId) {
+      console.log(`[Bitable] 项目 "${project.name}" 专属任务表就绪: ${tableId}`);
+    } else {
+      console.warn(`[Bitable] 项目 "${project.name}" 专属任务表创建失败，将 fallback 到全局表`);
+    }
+
+    return tableId;
+  }
+
+  /**
+   * P2: 获取所有项目列表（含任务表ID）
+   */
+  async listAllProjectsWithTaskTables(): Promise<Project[]> {
+    const config = this.ensureConfig();
+    try {
+      const result = await this.apiFetch(
+        `/bitable/v1/apps/${config.appToken}/tables/${config.projectTableId}/records/search?user_id_type=open_id`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            field_names: Object.values(PROJECT_FIELDS),
+            automatic_fields: true,
+          }),
+        }
+      );
+      const items = ((result.data as Record<string, unknown>)?.items as unknown[]) ?? [];
+      if ((result.code as number) !== 0) return [];
+      return items
+        .map(item => this.parseProjectRecord(item as Record<string, unknown>))
+        .filter((p): p is Project => p !== null);
+    } catch (error) {
+      console.error('[Bitable] 获取项目列表异常:', error);
+      return [];
+    }
+  }
+
+  /**
+   * P2: 获取所有带有任务表的项目（用于跨表搜索）
+   */
+  async getProjectsWithTaskTables(): Promise<Array<{ projectId: string; projectName: string; taskTableId: string }>> {
+    const projects = await this.listAllProjectsWithTaskTables();
+    return projects
+      .filter(p => p.task_table_id !== null)
+      .map(p => ({
+        projectId: p.project_id,
+        projectName: p.name,
+        taskTableId: p.task_table_id!,
+      }));
+  }
+
+  /**
+   * 项目任务表的字段定义（复用全局任务表结构）
+   */
+  private getProjectTaskFieldDefinitions(): Array<{ field_name: string; type: number; property?: Record<string, unknown> }> {
+    // 与全局任务表保持一致的字段结构
+    return [
+      // A 组（status/priority/blocked_reason/title 已在建表时创建）
+      { field_name: TASK_FIELDS.execution_agent, type: 1 },
+      // B 组
+      { field_name: TASK_FIELDS.chat_link, type: 15 },
+      { field_name: TASK_FIELDS.description, type: 1 },
+      { field_name: TASK_FIELDS.workspace_path, type: 1 },
+      // C 组
+      { field_name: TASK_FIELDS.started_at, type: 5 },
+      { field_name: TASK_FIELDS.done_at, type: 5 },
+      { field_name: TASK_FIELDS.created_at, type: 5 },
+      { field_name: TASK_FIELDS.closed_at, type: 5 },
+      { field_name: TASK_FIELDS.status_updated_at, type: 5 },
+      { field_name: TASK_FIELDS.unblocked_at, type: 5 },
+      { field_name: TASK_FIELDS.updated_at, type: 5 },
+      // D 组
+      { field_name: TASK_FIELDS.deliverable_summary, type: 1 },
+      // E 组
+      { field_name: TASK_FIELDS.task_id, type: 1 },
+      { field_name: TASK_FIELDS.project_id, type: 1 },
+      { field_name: TASK_FIELDS.chat_id, type: 1 },
+      { field_name: TASK_FIELDS.opencode_session_id, type: 1 },
+      { field_name: TASK_FIELDS.creator_open_id, type: 1 },
+      { field_name: TASK_FIELDS.archived, type: 7 },
+      { field_name: TASK_FIELDS.archived_at, type: 5 },
+    ];
+  }
+
   /**
    * 获取所有项目列表
    */
@@ -236,14 +511,56 @@ class BitableClient {
 
   // ===== Task 表操作 =====
 
+  /**
+   * P2-A: 创建新任务，支持项目专属任务表路由（含明确 fallback 语义）
+   *
+   * 路由策略：
+   * 1. 未指定项目 → 使用全局任务表（向后兼容）
+   * 2. 指定项目且项目有 task_table_id → 路由到项目专属表
+   * 3. 指定项目但无 task_table_id → 惰性创建，成功则路由到项目专属表
+   * 4. 指定项目但惰性创建失败 → FALLBACK 到全局任务表（保证任务不丢失）
+   *
+   * Fallback 到全局表的场景：
+   * - 项目创建任务表 API 调用失败
+   * - 任务表字段创建失败
+   * - 项目记录 task_table_id 写回失败（真实失败，不静默成功）
+   */
   async createTask(input: CreateTaskInput, sessionId: string, chatId: string): Promise<Task | null> {
     const config = this.ensureConfig();
-    
-    let projectId: string | null = null;
-    if (input.project_name) {
-      const project = await this.findOrCreateProject(input.project_name);
-      projectId = project?.project_id ?? null;
+
+    let project: Project | null = null;
+    let targetTableId: string = config.taskTableId; // 默认使用全局表（向后兼容 fallback）
+    let routingReason = '未指定项目，使用全局表';
+
+    // P2-A: 项目路由逻辑（带明确 fallback 语义）
+    if (input.project_id || input.project_name) {
+      if (input.project_id) {
+        project = await this.findProjectById(input.project_id);
+      }
+
+      if (!project && input.project_name) {
+        project = await this.findOrCreateProject(input.project_name);
+      }
+
+    if (project) {
+      // 获取或创建项目专属任务表
+      const projectTaskTableId = await this.getOrCreateProjectTaskTable(project);
+        if (projectTaskTableId) {
+          targetTableId = projectTaskTableId;
+          routingReason = `项目 "${project.name}" 专属表`;
+        } else {
+          // P2-A: 明确 fallback 语义 - 惰性创建失败时使用全局表
+          routingReason = `项目 "${project.name}" 专属表创建失败，fallback 到全局表`;
+          console.warn(`[Bitable] ${routingReason}`);
+        }
+      } else {
+        const requestedProjectRef = input.project_id ?? input.project_name;
+        routingReason = `项目 "${requestedProjectRef}" 查找/创建失败，使用全局表`;
+        console.warn(`[Bitable] ${routingReason}`);
+      }
     }
+
+    console.log(`[Bitable] 任务路由: ${routingReason} (表: ${targetTableId})`);
 
     // 飞书 Bitable 字段格式规则：
     // - 日期字段：毫秒级时间戳数字（不是 ISO 字符串）
@@ -254,12 +571,16 @@ class BitableClient {
     // 飞书 AppLink 打开群聊的正确参数是 openChatId（官方文档确认）
     const chatLink = `https://applink.feishu.cn/client/chat/open?openChatId=${chatId}`;
 
+    // P2-A: execution_agent 优先级：显式传入 > 项目配置 > 'default'
+    const executionAgent = input.execution_agent
+      ?? project?.default_execution_agent
+      ?? 'default';
+
     const fields: Record<string, unknown> = {
       [TASK_FIELDS.title]: input.title,
       [TASK_FIELDS.status]: TASK_STATUS_LABELS.TODO,
       [TASK_FIELDS.priority]: TASK_PRIORITY_LABELS.medium,
-      [TASK_FIELDS.health]: 'GREEN',
-      [TASK_FIELDS.assignee]: input.creator_open_id,  // 文本字段（type=1），直接写 open_id
+      [TASK_FIELDS.execution_agent]: executionAgent,
       [TASK_FIELDS.chat_link]: { link: chatLink, text: '打开群聊' },  // URL 字段
       [TASK_FIELDS.workspace_path]: input.workspace_path,
       [TASK_FIELDS.created_at]: nowMs,           // 毫秒时间戳
@@ -268,25 +589,40 @@ class BitableClient {
       [TASK_FIELDS.chat_id]: chatId,
       [TASK_FIELDS.opencode_session_id]: sessionId,
       [TASK_FIELDS.creator_open_id]: input.creator_open_id,
-      [TASK_FIELDS.hidden]: false,
+      [TASK_FIELDS.archived]: false,
     };
 
     if (input.description) {
       fields[TASK_FIELDS.description] = input.description;
     }
-    if (projectId) {
-      fields[TASK_FIELDS.project_id] = projectId;
+    if (project) {
+      fields[TASK_FIELDS.project_id] = project.project_id;
     }
 
     try {
-      const result = await this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${config.taskTableId}/records?user_id_type=open_id`, {
+      const createRecord = (tableId: string) => this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${tableId}/records?user_id_type=open_id`, {
         method: 'POST', body: JSON.stringify({ fields }),
       });
+
+      let result = await createRecord(targetTableId);
       if ((result.code as number) !== 0) {
         console.error(`[Bitable] 创建任务失败: code=${result.code}, msg=${result.msg}`);
-        return null;
+
+        if (targetTableId !== config.taskTableId) {
+          console.warn(`[Bitable] 项目专属表写入失败，fallback 到全局表重试: ${targetTableId}`);
+          targetTableId = config.taskTableId;
+          routingReason = `项目表写入失败，fallback 到全局表`;
+          console.warn(`[Bitable] ${routingReason}`);
+          result = await createRecord(targetTableId);
+        }
+
+        if ((result.code as number) !== 0) {
+          console.error(`[Bitable] fallback 后创建任务仍失败: code=${result.code}, msg=${result.msg}`);
+          return null;
+        }
       }
-      console.log(`[Bitable] 创建任务成功: ${input.title}`);
+
+      console.log(`[Bitable] 创建任务成功: ${input.title} (表: ${targetTableId})`);
       return this.parseTaskRecord((result.data as Record<string, unknown>)?.record as Record<string, unknown>);
     } catch (error) {
       console.error('[Bitable] 创建任务异常:', JSON.stringify(error, null, 2));
@@ -294,25 +630,31 @@ class BitableClient {
     }
   }
 
-  async findTaskByChatId(chatId: string): Promise<Task | null> {
+  /**
+   * P2: 在指定表中查找任务
+   */
+  async findTaskByChatIdInTable(tableId: string, chatId: string): Promise<Task | null> {
     const config = this.ensureConfig();
     try {
-      const result = await this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${config.taskTableId}/records/search?user_id_type=open_id`, {
+      const result = await this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${tableId}/records/search?user_id_type=open_id`, {
         method: 'POST', body: JSON.stringify({ field_names: Object.values(TASK_FIELDS), filter: { conditions: [{ field_name: TASK_FIELDS.chat_id, operator: 'is', value: [chatId] }], conjunction: 'and' }, automatic_fields: false }),
       });
       const items = ((result.data as Record<string, unknown>)?.items as unknown[]) ?? [];
       if ((result.code as number) !== 0 || !items.length) return null;
       return this.parseTaskRecord(items[0] as Record<string, unknown>);
     } catch (error) {
-      console.error('[Bitable] 查找任务异常:', error);
+      console.error(`[Bitable] 在表 ${tableId} 查找任务异常:`, error);
       return null;
     }
   }
 
-  async findTaskBySessionId(sessionId: string): Promise<Task | null> {
+  /**
+   * P2: 在指定表中按session查找任务
+   */
+  async findTaskBySessionIdInTable(tableId: string, sessionId: string): Promise<Task | null> {
     const config = this.ensureConfig();
     try {
-      const result = await this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${config.taskTableId}/records/search?user_id_type=open_id`, {
+      const result = await this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${tableId}/records/search?user_id_type=open_id`, {
         method: 'POST', body: JSON.stringify({ field_names: Object.values(TASK_FIELDS), filter: { conditions: [{ field_name: TASK_FIELDS.opencode_session_id, operator: 'is', value: [sessionId] }], conjunction: 'and' }, automatic_fields: false }),
       });
       const items = ((result.data as Record<string, unknown>)?.items as unknown[]) ?? [];
@@ -322,15 +664,63 @@ class BitableClient {
 
       return this.parseTaskRecord(items[0] as Record<string, unknown>);
     } catch (error) {
-      console.error('[Bitable] 查找任务异常:', error);
+      console.error(`[Bitable] 在表 ${tableId} 按session查找任务异常:`, error);
       return null;
     }
+  }
+
+  async findTaskBySessionId(sessionId: string): Promise<Task | null> {
+    const config = this.ensureConfig();
+
+    // P2: 先搜索全局表（向后兼容）
+    const globalResult = await this.findTaskBySessionIdInTable(config.taskTableId, sessionId);
+    if (globalResult) return globalResult;
+
+    // P2: 再搜索所有项目专属任务表
+    const projects = await this.getProjectsWithTaskTables();
+    for (const project of projects) {
+      const task = await this.findTaskBySessionIdInTable(project.taskTableId, sessionId);
+      if (task) {
+        console.log(`[Bitable] 在项目 "${project.projectName}" 表中找到任务`);
+        return task;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * P2: 跨表查找任务（按chatId）
+   * 优先搜索全局表，再搜索所有项目专属任务表
+   */
+  async findTaskByChatId(chatId: string): Promise<Task | null> {
+    const config = this.ensureConfig();
+
+    // P2: 先搜索全局表（向后兼容）
+    const globalResult = await this.findTaskByChatIdInTable(config.taskTableId, chatId);
+    if (globalResult) return globalResult;
+
+    // P2: 再搜索所有项目专属任务表
+    const projects = await this.getProjectsWithTaskTables();
+    for (const project of projects) {
+      const task = await this.findTaskByChatIdInTable(project.taskTableId, chatId);
+      if (task) {
+        console.log(`[Bitable] 在项目 "${project.projectName}" 表中找到任务`);
+        return task;
+      }
+    }
+
+    return null;
   }
 
   async updateTaskStatus(recordId: string, status: TaskStatus, extraFields: Record<string, unknown> = {}): Promise<boolean> {
     const config = this.ensureConfig();
     const nowMs = Date.now();
-    
+
+    // P2: 查找任务所在的表
+    const location = await this.findTaskTableForUpdate(recordId);
+    const targetTableId = location?.tableId ?? config.taskTableId;
+
     // 针对 1254045 乐观锁冲突的重试逻辑
     const maxRetries = 3;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -346,9 +736,9 @@ class BitableClient {
             mappedExtraFields[key] = value;
           }
         }
-        
+
         const result = await this.apiFetch(
-          `/bitable/v1/apps/${config.appToken}/tables/${config.taskTableId}/records/${recordId}?user_id_type=open_id`,
+          `/bitable/v1/apps/${config.appToken}/tables/${targetTableId}/records/${recordId}?user_id_type=open_id`,
           { method: 'PUT', body: JSON.stringify({ fields: { [TASK_FIELDS.status]: TASK_STATUS_LABELS[status], [TASK_FIELDS.status_updated_at]: nowMs, [TASK_FIELDS.updated_at]: nowMs, ...mappedExtraFields } }) }
         );
         
@@ -378,11 +768,63 @@ class BitableClient {
     return false;
   }
 
+  /**
+   * P2: 查找任务所在的表（用于更新时确定目标表）
+   * 返回 { tableId, task } 或 null
+   */
+  async findTaskTableForUpdate(recordId: string): Promise<{ tableId: string; task: Task } | null> {
+    const config = this.ensureConfig();
+
+    // 1. 先检查全局表
+    try {
+      const result = await this.apiFetch(
+        `/bitable/v1/apps/${config.appToken}/tables/${config.taskTableId}/records/${recordId}?user_id_type=open_id`,
+        { method: 'GET' }
+      );
+      if ((result.code as number) === 0) {
+        const record = (result.data as Record<string, unknown>)?.record as Record<string, unknown>;
+        if (record) {
+          const task = this.parseTaskRecord(record);
+          if (task) return { tableId: config.taskTableId, task };
+        }
+      }
+    } catch {
+      // 全局表未找到，继续搜索项目表
+    }
+
+    // 2. 搜索所有项目专属任务表
+    const projects = await this.getProjectsWithTaskTables();
+    for (const project of projects) {
+      try {
+        const result = await this.apiFetch(
+          `/bitable/v1/apps/${config.appToken}/tables/${project.taskTableId}/records/${recordId}?user_id_type=open_id`,
+          { method: 'GET' }
+        );
+        if ((result.code as number) === 0) {
+          const record = (result.data as Record<string, unknown>)?.record as Record<string, unknown>;
+          if (record) {
+            const task = this.parseTaskRecord(record);
+            if (task) return { tableId: project.taskTableId, task };
+          }
+        }
+      } catch {
+        // 当前项目表未找到，继续下一个
+      }
+    }
+
+    return null;
+  }
+
   async updateTaskFields(
     recordId: string,
     fields: Partial<Record<keyof typeof TASK_FIELDS, string | number | boolean | null>>
   ): Promise<boolean> {
     const config = this.ensureConfig();
+
+    // P2: 查找任务所在的表
+    const location = await this.findTaskTableForUpdate(recordId);
+    const targetTableId = location?.tableId ?? config.taskTableId;
+
     // 将英文字段名（keyof TASK_FIELDS）映射为飞书中文字段名（TASK_FIELDS[key]）
     const filteredFields: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(fields)) {
@@ -394,7 +836,7 @@ class BitableClient {
       }
     }
     try {
-      const result = await this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${config.taskTableId}/records/${recordId}?user_id_type=open_id`, {
+      const result = await this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${targetTableId}/records/${recordId}?user_id_type=open_id`, {
         method: 'PUT', body: JSON.stringify({ fields: { ...filteredFields, [TASK_FIELDS.updated_at]: Date.now() } }),
       });
       return (result.code as number) === 0;
@@ -407,9 +849,14 @@ class BitableClient {
   async setBlocked(recordId: string, reason: BlockedReason): Promise<boolean> {
     const config = this.ensureConfig();
     const nowMs = Date.now();
+
+    // P2: 查找任务所在的表
+    const location = await this.findTaskTableForUpdate(recordId);
+    const targetTableId = location?.tableId ?? config.taskTableId;
+
     try {
-      const result = await this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${config.taskTableId}/records/${recordId}?user_id_type=open_id`, {
-        method: 'PUT', body: JSON.stringify({ fields: { [TASK_FIELDS.status]: TASK_STATUS_LABELS.BLOCKED, [TASK_FIELDS.blocked_reason]: BLOCKED_REASON_LABELS[reason], [TASK_FIELDS.health]: 'RED', [TASK_FIELDS.status_updated_at]: nowMs, [TASK_FIELDS.updated_at]: nowMs } }),
+      const result = await this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${targetTableId}/records/${recordId}?user_id_type=open_id`, {
+        method: 'PUT', body: JSON.stringify({ fields: { [TASK_FIELDS.status]: TASK_STATUS_LABELS.BLOCKED, [TASK_FIELDS.blocked_reason]: BLOCKED_REASON_LABELS[reason], [TASK_FIELDS.status_updated_at]: nowMs, [TASK_FIELDS.updated_at]: nowMs } }),
       });
       if ((result.code as number) === 0) console.log(`[Bitable] 设置任务阻塞: ${recordId} -> ${reason}`);
       return (result.code as number) === 0;
@@ -422,9 +869,14 @@ class BitableClient {
   async clearBlocked(recordId: string): Promise<boolean> {
     const config = this.ensureConfig();
     const nowMs = Date.now();
+
+    // P2: 查找任务所在的表
+    const location = await this.findTaskTableForUpdate(recordId);
+    const targetTableId = location?.tableId ?? config.taskTableId;
+
     try {
-      const result = await this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${config.taskTableId}/records/${recordId}?user_id_type=open_id`, {
-        method: 'PUT', body: JSON.stringify({ fields: { [TASK_FIELDS.status]: TASK_STATUS_LABELS.IN_PROGRESS, [TASK_FIELDS.health]: 'GREEN', [TASK_FIELDS.unblocked_at]: nowMs, [TASK_FIELDS.status_updated_at]: nowMs, [TASK_FIELDS.updated_at]: nowMs } }),
+      const result = await this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${targetTableId}/records/${recordId}?user_id_type=open_id`, {
+        method: 'PUT', body: JSON.stringify({ fields: { [TASK_FIELDS.status]: TASK_STATUS_LABELS.IN_PROGRESS, [TASK_FIELDS.unblocked_at]: nowMs, [TASK_FIELDS.status_updated_at]: nowMs, [TASK_FIELDS.updated_at]: nowMs } }),
       });
       if ((result.code as number) === 0) console.log(`[Bitable] 清除任务阻塞: ${recordId}`);
       return (result.code as number) === 0;
@@ -434,25 +886,52 @@ class BitableClient {
     }
   }
 
-  async listTasks(filter?: TaskFilter): Promise<Task[]> {
+  async listTasksFromTable(tableId: string, filter?: TaskFilter): Promise<Task[]> {
     const config = this.ensureConfig();
     const conditions: Array<{ field_name: string; operator: string; value: string[] }> = [];
-    if (filter?.hidden !== undefined) {
-      conditions.push({ field_name: TASK_FIELDS.hidden, operator: 'is', value: [String(filter.hidden)] });
+    if (filter?.archived !== undefined) {
+      conditions.push({ field_name: TASK_FIELDS.archived, operator: 'is', value: [String(filter.archived)] });
+    }
+    if (filter?.project_id) {
+      conditions.push({ field_name: TASK_FIELDS.project_id, operator: 'is', value: [filter.project_id] });
+    }
+    if (filter?.creator_open_id) {
+      conditions.push({ field_name: TASK_FIELDS.creator_open_id, operator: 'is', value: [filter.creator_open_id] });
     }
     const searchData: Record<string, unknown> = { field_names: Object.values(TASK_FIELDS), automatic_fields: false };
     if (conditions.length > 0) searchData.filter = { conditions, conjunction: 'and' };
     try {
-      const result = await this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${config.taskTableId}/records/search?user_id_type=open_id`, {
+      const result = await this.apiFetch(`/bitable/v1/apps/${config.appToken}/tables/${tableId}/records/search?user_id_type=open_id`, {
         method: 'POST', body: JSON.stringify(searchData),
       });
       const items = ((result.data as Record<string, unknown>)?.items as unknown[]) ?? [];
       if ((result.code as number) !== 0) return [];
       return items.map(item => this.parseTaskRecord(item as Record<string, unknown>)).filter((t): t is Task => t !== null);
     } catch (error) {
-      console.error('[Bitable] 列出任务异常:', error);
+      console.error(`[Bitable] 从表 ${tableId} 列出任务异常:`, error);
       return [];
     }
+  }
+
+  /**
+   * P2: 列出所有任务（跨全局表和项目专属表）
+   */
+  async listTasks(filter?: TaskFilter): Promise<Task[]> {
+    const config = this.ensureConfig();
+    const allTasks: Task[] = [];
+
+    // 1. 从全局表获取任务
+    const globalTasks = await this.listTasksFromTable(config.taskTableId, filter);
+    allTasks.push(...globalTasks);
+
+    // 2. 从所有项目专属任务表获取任务
+    const projects = await this.getProjectsWithTaskTables();
+    for (const project of projects) {
+      const projectTasks = await this.listTasksFromTable(project.taskTableId, filter);
+      allTasks.push(...projectTasks);
+    }
+
+    return allTasks;
   }
 
   // ===== 解析方法 =====
@@ -470,10 +949,40 @@ class BitableClient {
         repoUrl = String(repoUrlField);
       }
     }
+
+     // P2: 项目表中持久化的是任务表链接，这里优先从 URL link 解析回内部 table_id
+     const taskTableField = f[PROJECT_FIELDS.task_table_id];
+     const taskTableLink = this.parseUrlFieldLink(taskTableField);
+     const taskTableRaw = taskTableLink ?? this.parseNullableTextField(taskTableField);
+     const taskTableId = this.parseTaskTableId(taskTableRaw);
+
+    // P2: 解析默认执行Agent
+    const defaultExecutionAgent = this.parseNullableTextField(f[PROJECT_FIELDS.default_execution_agent]);
+
+    // P2: 解析工作目录配置（JSON数组字符串）
+    let workspacePaths: string[] | null = null;
+    const workspacePathsField = f[PROJECT_FIELDS.workspace_paths];
+    if (workspacePathsField) {
+      const pathsText = this.parseNullableTextField(workspacePathsField);
+      if (pathsText) {
+        try {
+          const parsed = JSON.parse(pathsText) as unknown;
+          if (Array.isArray(parsed)) {
+            workspacePaths = parsed.filter((item): item is string => typeof item === 'string');
+          }
+        } catch {
+          // JSON解析失败，忽略
+        }
+      }
+    }
+
     return {
       project_id: record.record_id,
       name: this.parseTextField(f[PROJECT_FIELDS.name]),
       repo_url: repoUrl,
+      task_table_id: taskTableId,
+      default_execution_agent: defaultExecutionAgent,
+      workspace_paths: workspacePaths,
       created_at: this.parseDate(f[PROJECT_FIELDS.created_at]),
       updated_at: this.parseDate(f[PROJECT_FIELDS.updated_at]),
     };
@@ -504,15 +1013,12 @@ class BitableClient {
       title: this.parseTextField(f[TASK_FIELDS.title]),
       status: this.parseStatus(f[TASK_FIELDS.status]),
       priority: this.parsePriority(f[TASK_FIELDS.priority]),
-      health: this.parseHealth(f[TASK_FIELDS.health]),
       blocked_reason: this.parseBlockedReason(f[TASK_FIELDS.blocked_reason]),
-      assignee: this.parseTextField(f[TASK_FIELDS.assignee]),
-      topic: this.parseTopic(f[TASK_FIELDS.topic]),
+      execution_agent: this.parseTextField(f[TASK_FIELDS.execution_agent]),
       
       chat_link: this.parseTextField(f[TASK_FIELDS.chat_link]),
       description: this.parseNullableTextField(f[TASK_FIELDS.description]),
       workspace_path: this.parseTextField(f[TASK_FIELDS.workspace_path]),
-      working_branch: this.parseNullableTextField(f[TASK_FIELDS.working_branch]),
       
       started_at: this.parseNullableDate(f[TASK_FIELDS.started_at]),
       done_at: this.parseNullableDate(f[TASK_FIELDS.done_at]),
@@ -520,28 +1026,16 @@ class BitableClient {
       closed_at: this.parseNullableDate(f[TASK_FIELDS.closed_at]),
       status_updated_at: this.parseDate(f[TASK_FIELDS.status_updated_at]),
       unblocked_at: this.parseNullableDate(f[TASK_FIELDS.unblocked_at]),
-      blocked_history: this.parseNullableTextField(f[TASK_FIELDS.blocked_history]),
-      followup_task_id: this.parseNullableTextField(f[TASK_FIELDS.followup_task_id]),
       updated_at: this.parseDate(f[TASK_FIELDS.updated_at]),
       
       deliverable_summary: this.parseNullableTextField(f[TASK_FIELDS.deliverable_summary]),
-      deliverable_md: this.parseNullableTextField(f[TASK_FIELDS.deliverable_md]),
       
       project_id: this.parseNullableTextField(f[TASK_FIELDS.project_id]),
       chat_id: this.parseTextField(f[TASK_FIELDS.chat_id]),
       opencode_session_id: this.parseTextField(f[TASK_FIELDS.opencode_session_id]),
       creator_open_id: this.parseTextField(f[TASK_FIELDS.creator_open_id]),
-      sync_last_message_id: this.parseNullableTextField(f[TASK_FIELDS.sync_last_message_id]),
-      sync_last_push_at: this.parseNullableDate(f[TASK_FIELDS.sync_last_push_at]),
-      git_diffstat: this.parseNullableTextField(f[TASK_FIELDS.git_diffstat]),
-      files_changed: this.parseNullableNumber(f[TASK_FIELDS.files_changed]),
-      insertions: this.parseNullableNumber(f[TASK_FIELDS.insertions]),
-      deletions: this.parseNullableNumber(f[TASK_FIELDS.deletions]),
-      git_commits: this.parseNullableTextField(f[TASK_FIELDS.git_commits]),
-      git_base_commit: this.parseNullableTextField(f[TASK_FIELDS.git_base_commit]),
-      hidden: Boolean(f[TASK_FIELDS.hidden]),
+      archived: Boolean(f[TASK_FIELDS.archived]),
       archived_at: this.parseNullableDate(f[TASK_FIELDS.archived_at]),
-      failure_step: this.parseNullableTextField(f[TASK_FIELDS.failure_step]),
     } as Task;
   }
 
@@ -581,13 +1075,6 @@ class BitableClient {
       if (val === label) return key as TaskPriority;
     }
     return 'medium';
-  }
-
-  private parseHealth(value: unknown): 'GREEN' | 'YELLOW' | 'RED' {
-    if (!value || typeof value !== 'string') return 'GREEN';
-    const v = value.toUpperCase();
-    if (v === 'YELLOW' || v === 'RED') return v;
-    return 'GREEN';
   }
 
   private parseBlockedReason(value: unknown): BlockedReason | null {
