@@ -8,14 +8,31 @@ import { delayedResponseHandler } from './opencode/delayed-handler.js';
 import { questionHandler } from './opencode/question-handler.js';
 import { permissionHandler } from './permissions/handler.js';
 import { chatSessionStore, type InteractionRecord } from './store/chat-session.js';
+import { taskStore } from './store/task-store.js';
+import { bitableClient } from './feishu/bitable-client.js';
+import { bitableBootstrap } from './feishu/bitable-bootstrap.js';
 import { p2pHandler } from './handlers/p2p.js';
 import { groupHandler } from './handlers/group.js';
 import { lifecycleHandler } from './handlers/lifecycle.js';
 import { createDiscordHandler } from './handlers/discord.js';
 import { commandHandler } from './handlers/command.js';
 import { cardActionHandler } from './handlers/card-action.js';
-import { validateConfig, routerConfig, outputConfig, reliabilityConfig, opencodeConfig } from './config.js';
+import { memberEventsHandler } from './handlers/member-events.js';
+import { taskLifecycleHandler } from './handlers/task-lifecycle.js';
+import { validateConfig, routerConfig, outputConfig, bitableConfig, reliabilityConfig, opencodeConfig } from './config.js';
 import { rootRouter } from './router/root-router.js';
+import {
+  createPermissionActionCallbacks,
+  createQuestionActionCallbacks,
+} from './router/action-handlers.js';
+import { openCodeEventHub } from './router/opencode-event-hub.js';
+import {
+  buildStreamCards,
+  type StreamCardData,
+  type StreamCardSegment,
+  type StreamCardPendingPermission,
+  type StreamCardPendingQuestion,
+} from './feishu/cards-stream.js';
 import { ConversationHeartbeatEngine } from './reliability/conversation-heartbeat.js';
 import { CronScheduler } from './reliability/scheduler.js';
 import { createInternalJobRegistry } from './reliability/job-registry.js';
@@ -31,18 +48,6 @@ import { decideRescuePolicy } from './reliability/rescue-policy.js';
 import { executeRescuePipeline } from './reliability/rescue-executor.js';
 import { reportRecoveryContext } from './reliability/recovery-reporter.js';
 import { FailureType, RescueState } from './reliability/types.js';
-import {
-  createPermissionActionCallbacks,
-  createQuestionActionCallbacks,
-} from './router/action-handlers.js';
-import { openCodeEventHub } from './router/opencode-event-hub.js';
-import {
-  buildStreamCards,
-  type StreamCardData,
-  type StreamCardSegment,
-  type StreamCardPendingPermission,
-  type StreamCardPendingQuestion,
-} from './feishu/cards-stream.js';
 
 export interface ReliabilityRescueOrchestrator {
   runWatchdogProbe: () => Promise<void> | void;
@@ -495,7 +500,7 @@ export const bootstrapReliabilityLifecycle = (
 async function main() {
 
   console.log('╔════════════════════════════════════════════════╗');
-console.log('║   飞书 × OpenCode 桥接服务 v2.9.0 (Group)  ║');
+  console.log('║   飞书 × OpenCode 桥接服务 v2.9.0 (Group)  ║');
   console.log('╚════════════════════════════════════════════════╝');
 
   // 1. 验证配置
@@ -518,12 +523,67 @@ console.log('║   飞书 × OpenCode 桥接服务 v2.9.0 (Group)  ║');
     console.log(`[Config] 📝 如需回滚到旧版路由，设置 ROUTER_MODE=legacy 并重启服务`);
   }
 
+  // 1.5 初始化任务看板
+  let bootstrapConfig: { appToken: string; taskTableId: string; projectTableId: string } | null = null;
+  if (bitableConfig.appToken && bitableConfig.taskTableId && bitableConfig.projectTableId) {
+    bootstrapConfig = {
+      appToken: bitableConfig.appToken,
+      taskTableId: bitableConfig.taskTableId,
+      projectTableId: bitableConfig.projectTableId,
+    };
+    bitableClient.configure(bootstrapConfig);
+    bitableConfig.enabled = true;
+    bitableBootstrap.loadStateForNotification();
+    const healthy = await bitableBootstrap.healthCheck(bootstrapConfig);
+    if (!healthy) {
+      console.warn('[Bootstrap] 健康检查失败，env var 配置指向的表格可能已损坏');
+    }
+  } else {
+    bootstrapConfig = await bitableBootstrap.initialize();
+    if (bootstrapConfig) {
+      bitableClient.configure(bootstrapConfig);
+      bitableConfig.enabled = true;
+      await bitableBootstrap.healthCheck(bootstrapConfig);
+    }
+  }
+  if (bootstrapConfig) {
+    const tasks = await taskStore.listTasks({ hidden: false });
+    console.log(`✅ 任务看板已就绪，加载 ${tasks.length} 个任务`);
+  } else {
+    console.warn('⚠️  任务看板初始化失败，任务相关功能不可用');
+  }
+
   // 2. 连接 OpenCode
   const connected = await opencodeClient.connect();
   if (!connected) {
     console.error('无法连接到OpenCode服务器，请确保 opencode serve 已运行');
     process.exit(1);
   }
+
+  // 2.5 注册 OpenCode 事件监听 - 任务生命周期
+  opencodeClient.on('permissionRequest', (event) => {
+    const sid = event.sessionId;
+    if (sid) {
+      taskLifecycleHandler.onSessionFirstToolCall(sid).catch(console.error);
+      taskLifecycleHandler.onPermissionAsked(sid).catch(console.error);
+    }
+  });
+
+  opencodeClient.on('questionAsked', (event: Record<string, unknown>) => {
+    const sid = (event as Record<string, unknown>).sessionID || (event as Record<string, unknown>).sessionId;
+    if (sid && typeof sid === 'string') {
+      taskLifecycleHandler.onSessionFirstToolCall(sid).catch(console.error);
+      taskLifecycleHandler.onQuestionAsked(sid).catch(console.error);
+    }
+  });
+
+  opencodeClient.on('sessionStatus', (event: Record<string, unknown>) => {
+    const sid = (event as Record<string, unknown>).sessionID || (event as Record<string, unknown>).sessionId;
+    const status = event?.status as Record<string, unknown> | undefined;
+    if (sid && typeof sid === 'string' && status?.type === 'busy') {
+      taskLifecycleHandler.onSessionFirstToolCall(sid).catch(console.error);
+    }
+  });
 
   // 3. 配置输出缓冲 (流式响应)
   const streamContentMap = new Map<string, { text: string; thinking: string }>();
@@ -1725,6 +1785,27 @@ console.log('║   飞书 × OpenCode 桥接服务 v2.9.0 (Group)  ║');
   // 4. 监听飞书消息（通过路由器分发）
   feishuClient.on('message', async (event) => {
     await reliabilityLifecycle.onInboundMessage();
+    // 首次交互时按需开通任务看板权限
+    if (bootstrapConfig) {
+      const senderId = event.senderId;
+      if (senderId) {
+        const bitableUrl = await bitableBootstrap.grantPermissionOnFirstInteraction(
+          bootstrapConfig.appToken,
+          senderId,
+        );
+        if (bitableUrl) {
+          try {
+            await feishuClient.sendDirectMessage(
+              senderId,
+              `✅ 已为你开通任务看板权限\n📊 点击查看任务看板：${bitableUrl}`,
+            );
+          } catch {
+            // 发送失败不阻断主流程
+          }
+        }
+      }
+    }
+
     await rootRouter.onMessage(event);
   });
 
@@ -1825,6 +1906,9 @@ console.log('║   飞书 × OpenCode 桥接服务 v2.9.0 (Group)  ║');
 
   // 7. 监听生命周期事件 (需要在启动后注册)
   feishuClient.onMemberLeft(async (chatId, memberId) => {
+    // 任务群：创建者退群时自动拉回
+    await memberEventsHandler.handleMemberRemoved({ chatId, userId: memberId });
+    // 生命周期清理
     await lifecycleHandler.handleMemberLeft(chatId, memberId);
   });
 
@@ -1833,6 +1917,9 @@ console.log('║   飞书 × OpenCode 桥接服务 v2.9.0 (Group)  ║');
     if (reliabilityConfig.cronOrphanAutoCleanup) {
       cleanupRuntimeCronJobsByConversation(getRuntimeCronManager(), 'feishu', chatId);
     }
+    // 任务群：清理缓存
+    await memberEventsHandler.handleChatDisbanded(chatId);
+    // 生命周期清理
     chatSessionStore.removeSession(chatId);
   });
   
@@ -1875,8 +1962,72 @@ console.log('║   飞书 × OpenCode 桥接服务 v2.9.0 (Group)  ║');
   });
   await feishuClient.start();
 
+  // 8.5 Bootstrap 完成后通知管理员（仅全新创建时）
+  if (bootstrapConfig && bitableBootstrap.isNewlyCreated()) {
+    const bitableUrl = bitableBootstrap.getBitableUrl();
+    const adminUsers = (process.env.ALLOWED_USERS ?? '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    if (bitableUrl && adminUsers.length > 0) {
+      const msg = [
+        '🎉 LarkBridge 任务看板已自动创建完成！',
+        '',
+        `📊 任务看板地址：${bitableUrl}`,
+        '',
+        '包含：任务表、项目表、状态看板视图',
+        '建议收藏此链接，后续可随时访问任务看板。',
+      ].join('\n');
+      for (const openId of adminUsers) {
+        try {
+          await feishuClient.sendDirectMessage(openId, msg);
+          console.log(`[Bootstrap] 已通知管理员: ${openId}`);
+        } catch {
+          console.warn(`[Bootstrap] 通知管理员失败: ${openId}`);
+        }
+      }
+    }
+  }
+
   // 9. 启动清理检查
   await lifecycleHandler.cleanUpOnStart();
+
+  // 10. 健康度监控定时任务
+  if (bootstrapConfig) {
+    const HEALTH_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+    const IN_PROGRESS_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
+    const BLOCKED_TIMEOUT_MS = 4 * 60 * 60 * 1000;
+
+    setInterval(async () => {
+      try {
+        const tasks = await taskStore.listTasks({ hidden: false });
+        const now = Date.now();
+        for (const task of tasks) {
+          const statusAge = now - task.status_updated_at.getTime();
+
+          if (task.status === 'IN_PROGRESS' && statusAge > IN_PROGRESS_TIMEOUT_MS) {
+            if (task.health !== 'YELLOW' && task.health !== 'RED') {
+              await taskStore.updateTaskFields(task.chat_id, { health: 'YELLOW' });
+              console.log(`[健康度] 任务超时 7 天，标记 YELLOW: ${task.title}`);
+              await feishuClient.sendText(task.chat_id,
+                `⚠️ 这个任务已进行 7 天，是否还在继续？\n/done - 确认完成\n/cancel - 取消任务`
+              ).catch(console.error);
+            }
+          } else if (task.status === 'BLOCKED' && statusAge > BLOCKED_TIMEOUT_MS) {
+            if (task.health !== 'RED') {
+              await taskStore.updateTaskFields(task.chat_id, { health: 'RED' });
+              console.log(`[健康度] 任务阻塞超 4 小时，标记 RED: ${task.title}`);
+              await feishuClient.sendText(task.chat_id,
+                `🚨 任务已阻塞超过 4 小时，请尽快处理！`
+              ).catch(console.error);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[健康度] 监控检查失败:', err);
+      }
+    }, HEALTH_CHECK_INTERVAL_MS);
+
+    console.log('[健康度] 监控定时任务已启动（每小时检查）');
+  }
 
   console.log('✅ 服务已就绪');
   

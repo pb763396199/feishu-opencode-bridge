@@ -275,6 +275,20 @@ function parseProjectAliases(value: string | undefined): Record<string, string> 
   }
 }
 
+// Bitable 多维表格配置（任务看板）
+export const bitableConfig = {
+  // 多维表格 App Token
+  appToken: process.env.BITABLE_APP_TOKEN?.trim() || undefined,
+  // 任务表 ID
+  taskTableId: process.env.BITABLE_TASK_TABLE_ID?.trim() || undefined,
+  // 项目表 ID
+  projectTableId: process.env.BITABLE_PROJECT_TABLE_ID?.trim() || undefined,
+  // 实例 ID（用于 Bootstrap 状态文件隔离）
+  instanceId: process.env.BRIDGE_INSTANCE_ID?.trim() || 'default',
+  // 是否启用任务看板功能（由 index.ts 启动后动态设置）
+  enabled: false as boolean,
+};
+
 // 目录配置
 export const directoryConfig = {
   allowedDirectories: (process.env.ALLOWED_DIRECTORIES || '')

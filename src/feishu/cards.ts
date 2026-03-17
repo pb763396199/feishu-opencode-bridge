@@ -677,3 +677,118 @@ export function buildWelcomeCard(userName: string, createChatData?: CreateChatCa
     elements: baseElements,
   };
 }
+
+// 创建任务卡片数据结构
+export interface CreateTaskCardData {
+  workspacePaths: string[];
+  projectNames: string[];
+}
+
+// 构建创建任务卡片（设计文档 §10.2）
+// 飞书 form 容器内不支持 div，用 input/select_static 自带的 label 属性实现标签。
+export function buildCreateTaskCard(data: CreateTaskCardData): object {
+  // 飞书 plain_text 会将反斜杠当转义字符处理，用正斜杠显示路径（Windows 路径两者均有效）
+  const workspaceOptions = data.workspacePaths.map(p => ({
+    text: { tag: 'plain_text', content: p.replace(/\\/g, '/') },
+    value: p,  // value 保留原始路径（用于后端处理）
+  }));
+
+  // 构建项目下拉选项
+  const projectOptions = data.projectNames.map(name => ({
+    text: { tag: 'plain_text', content: name },
+    value: name,
+  }));
+
+  // form 内每个 input/select 用 label 属性携带标签，实现"标签+输入框"紧挨排列
+  const formElements: object[] = [
+    {
+      tag: 'input',
+      name: 'task_title',
+      required: true,
+      label: { tag: 'plain_text', content: '任务名称 *（将作为群名）' },
+      label_position: 'top',
+      placeholder: { tag: 'plain_text', content: '例如：实现用户登录接口' },
+    },
+    {
+      tag: 'input',
+      name: 'task_description',
+      label: { tag: 'plain_text', content: '任务内容（选填，后续可用 /task 修改）' },
+      label_position: 'top',
+      placeholder: { tag: 'plain_text', content: '描述你想让 AI 做什么...' },
+      input_type: 'multiline_text',
+      rows: 3,
+      auto_resize: true,
+    },
+    // 所属项目选择（下拉框有标签，输入框无标签）
+    ...(projectOptions.length > 0 ? [{
+      tag: 'select_static',
+      name: 'project_select',
+      label: { tag: 'plain_text', content: '📁 所属项目（下拉选择或手动输入）' },
+      label_position: 'top',
+      placeholder: { tag: 'plain_text', content: '选择已有项目...' },
+      options: [
+        { text: { tag: 'plain_text', content: '📝 手动输入项目名' }, value: '__manual__' },
+        ...projectOptions,
+      ],
+    }] : []),
+    {
+      tag: 'input',
+      name: 'project_name',
+      placeholder: { tag: 'plain_text', content: '手动输入项目名称...' },
+    },
+    // 工作目录选择（下拉框有标签，输入框无标签）
+    ...(workspaceOptions.length > 0 ? [{
+      tag: 'select_static',
+      name: 'workspace_select',
+      label: { tag: 'plain_text', content: '📂 工作目录（下拉选择或手动输入）' },
+      label_position: 'top',
+      placeholder: { tag: 'plain_text', content: '选择已有工作目录...' },
+      options: [
+        { text: { tag: 'plain_text', content: '📝 手动输入路径' }, value: '__manual__' },
+        ...workspaceOptions,
+      ],
+    }] : []),
+    {
+      tag: 'input',
+      name: 'workspace_path',
+      placeholder: { tag: 'plain_text', content: '手动输入工作目录路径...' },
+    },
+    {
+      tag: 'button',
+      text: { tag: 'plain_text', content: '创建任务' },
+      type: 'primary',
+      action_type: 'form_submit',
+      name: 'create_task_submit',
+      value: { action: 'create_task_submit' },
+    },
+  ];
+
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: '📋 新建任务' },
+    },
+    elements: [
+      // form 容器：label 在每个 input 上，无需外部 div
+      {
+        tag: 'form',
+        name: 'create_task_form',
+        elements: formElements,
+      },
+      { tag: 'hr' },
+      // 取消按钮在 form 外
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '取消' },
+            type: 'default',
+            value: { action: 'create_task_cancel' },
+          },
+        ],
+      },
+    ],
+  };
+}

@@ -220,7 +220,10 @@ describe('DirectoryPolicy - Path Normalization and Security', () => {
     });
 
     it('应该在无任何目录时返回 server 默认（空路径）', () => {
-      const result = DirectoryPolicy.resolve();
+      const result = DirectoryPolicy.resolve({
+        envDefaultDirectory: undefined,
+        serverDefaultDirectory: '',
+      });
 
       expect(result.ok).toBe(true);
       if (result.ok) {

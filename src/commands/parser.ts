@@ -29,7 +29,20 @@ export type CommandType =
   | 'send'         // 发送文件到飞书
   | 'rename'       // 重命名当前会话
   | 'cron'         // Cron 调度管理
-  | 'restart';     // 重启服务组件
+  | 'restart'      // 重启服务组件
+  | 'whoami'       // 查询当前用户的 open_id
+  | 'workspace'    // 查看或设置工作目录（两种群都可用）
+  // ===== 任务群专属命令 =====
+  | 'task'            // 查看或设置任务内容
+  | 'task_title'      // 查看或设置任务标题
+  | 'task_todo'       // 标记为待执行
+  | 'task_backlog'    // 移至待规划
+  | 'task_done'       // 标记完成（需确认）
+  | 'task_cancel'     // 取消任务
+  | 'task_followup'   // 创建续集任务
+  | 'task_close_task' // 解散任务群（需确认）
+  | 'create_task'     // 创建任务群（弹卡片）
+  ;
 
 // 解析后的命令
 export interface ParsedCommand {
@@ -62,6 +75,14 @@ export interface ParsedCommand {
   cronArgs?: string;
   cronSource?: 'slash' | 'natural';
   restartTarget?: string;
+  // workspace 命令相关字段
+  workspaceAction?: 'show' | 'set';
+  workspacePath?: string;
+  // 任务群命令相关字段
+  taskAction?: 'show' | 'set';
+  taskContent?: string;
+  taskTitleAction?: 'show' | 'set';
+  taskTitle?: string;
 }
 
 const BANG_SHELL_ALLOWED_COMMANDS = new Set([
@@ -256,7 +277,6 @@ export function parseCommand(text: string): ParsedCommand {
     switch (cmd) {
       case 'stop':
       case 'abort':
-      case 'cancel':
         return { type: 'stop' };
 
       case 'undo':
@@ -325,7 +345,8 @@ export function parseCommand(text: string): ParsedCommand {
 
       case 'project':
         if (args.length === 0) {
-          return { type: 'project', projectAction: 'list' };
+          // 兼容任务群 /project（查看当前任务所属项目）
+          return { type: 'project' };
         }
         if (args[0].toLowerCase() === 'list') {
           return { type: 'project', projectAction: 'list' };
@@ -421,6 +442,9 @@ export function parseCommand(text: string): ParsedCommand {
       case '?':
         return { type: 'help' };
 
+      case 'create_task':
+        return { type: 'create_task' };
+
       case 'status':
         return { type: 'status' };
 
@@ -441,6 +465,53 @@ export function parseCommand(text: string): ParsedCommand {
           ...(renameTitle ? { renameTitle } : {}),
         };
       }
+
+      case 'whoami':
+        return { type: 'whoami' };
+
+      // ===== 任务群专属命令 =====
+      case 'task':
+        if (args.length === 0) {
+          return { type: 'task', taskAction: 'show' };
+        }
+        return { type: 'task', taskAction: 'set', taskContent: args.join(' ') };
+
+      case 'task_title':
+        if (args.length === 0) {
+          return { type: 'task_title', taskTitleAction: 'show' };
+        }
+        return { type: 'task_title', taskTitleAction: 'set', taskTitle: args.join(' ') };
+
+      case 'workspace':
+        // workspace 命令在两种群都可用：
+        // - 无参数：显示当前工作目录
+        // - 有参数：设置新工作目录（类似 main 分支的 /project 行为）
+        if (args.length === 0) {
+          return { type: 'workspace', workspaceAction: 'show' };
+        }
+        return { type: 'workspace', workspaceAction: 'set', workspacePath: args.join(' ') };
+
+      case 'todo':
+        return { type: 'task_todo' };
+
+      case 'backlog':
+        return { type: 'task_backlog' };
+
+      case 'done':
+        return { type: 'task_done' };
+
+      case 'cancel':
+        // 注意：原有代码中 /cancel 被映射为 stop，这里改为任务取消
+        // 如果需要保留原有的 cancel -> stop 映射，需要调整
+        return { type: 'task_cancel' };
+
+      case 'followup':
+        return { type: 'task_followup' };
+
+      case 'close_task':
+      case 'closetask':
+      case 'close-task':
+        return { type: 'task_close_task' };
 
       default:
         // 未知命令透传到OpenCode（保留原始大小写）
@@ -463,17 +534,10 @@ export function parseCommand(text: string): ParsedCommand {
 }
 
 // 生成帮助文本
-export function getHelpText(): string {
+export function getHelpText(isTaskChat: boolean = false): string {
   const cronHelpBlock = buildCronHelpText('feishu');
-  return `📖 **飞书 × OpenCode 机器人指南**
-
-💬 **如何对话**
-群聊中 @机器人 或回复机器人消息，私聊中直接发送内容，即可与 AI 对话。
-
-🪄 **私聊首次使用**
-首次私聊会自动完成会话绑定（标题：私聊-MM-DD-HH-MM），并推送建群卡片、帮助文档和 /panel 卡片。
-
-🛠️ **常用命令**
+  // 通用命令（两种群都可用）
+  const commonCommands = `🛠️ **常用命令**
 • \`/model\` 查看当前模型
 • \`/model <名称>\` 切换模型 (e.g. \`/model gpt-4\`)
 • \`/agent\` 查看当前角色
@@ -488,26 +552,59 @@ export function getHelpText(): string {
 • \`/undo\` 撤回上一轮对话 (如果你发错或 AI 答错)
 • \`/stop\` 停止当前正在生成的回答
 • \`/compact\` 压缩当前会话上下文（调用 OpenCode summarize）
+• \`/workspace\` 查看当前工作目录
+• \`/workspace <路径>\` 设置工作目录并新建会话`;
 
-⚙️ **会话管理**
+  // 会话管理命令
+  const sessionCommands = `⚙️ **会话管理**
 • \`/session\` 或 \`/sessions\` 列出当前项目的会话；\`/sessions all\` 列出全部项目
 • \`/session new\` 开启新话题（重置上下文）；\`/session new <别名或路径>\` 指定项目
 • \`/session new --name <名称>\` 创建时直接命名 (e.g. \`/session new --name 技术架构评审\`)
 • \`/rename <新名称>\` 随时重命名当前会话 (e.g. \`/rename Q3后端API设计讨论\`)
 • \`/session <sessionId>\` 手动绑定已有会话（需开启 \`ENABLE_MANUAL_SESSION_BIND\`）
 • \`/create_chat\` 或 \`/建群\` 私聊中调出建群卡片（新建或绑定已有会话）
-• \`/project list\` 列出可用项目；\`/project default\` 查看/设置/清除群默认项目
-• \`/clear\` 等价 \`/session new\`；\`/clear free session\` 清理空闲群聊并手动扫描僵尸 Cron
+• \`/clear\` 等价 \`/session new\`；\`/clear free session\` 清理空闲群聊
 • \`/status\` 查看当前绑定状态和群聊生命周期信息
- • \`/commands\` 生成并发送最新命令清单文件
+• \`/commands\` 生成并发送最新命令清单文件`;
 
-💡 **提示**
+  // 任务群专属命令
+  const taskCommands = `📋 **任务群专属命令**
+• \`/task\` 查看任务内容
+• \`/task <内容>\` 设置任务内容
+• \`/task_title\` 查看任务标题
+• \`/task_title <标题>\` 修改任务标题（同步修改群名）
+• \`/project\` 查看所属项目名称
+• \`/todo\` 标记任务为待执行
+• \`/backlog\` 移至待规划
+• \`/done\` 标记任务完成
+• \`/cancel\` 取消任务
+• \`/close_task\` 解散任务群`;
+
+  // 构建帮助文本
+  let helpText = `📖 **飞书 × OpenCode 机器人指南**
+
+💬 **如何对话**
+群聊中 @机器人 或回复机器人消息，私聊中直接发送内容，即可与 AI 对话。
+
+🪄 **私聊首次使用**
+首次私聊会自动完成会话绑定（标题：私聊-MM-DD-HH-MM），并推送建群卡片、帮助文档和 /panel 卡片。
+
+${commonCommands}
+
+${sessionCommands}`;
+
+  // 任务群额外显示任务群专属命令
+  if (isTaskChat) {
+    helpText += `\n\n${taskCommands}`;
+  }
+
+  helpText += `\n\n💡 **提示**
 • 切换的模型/角色仅对**当前会话**生效。
 • 强度优先级：\`#临时覆盖\` > \`/effort 会话默认\` > OpenCode 默认。
 • \`/cron\` 支持自然语言，复杂语义默认交给 OpenCode 解析后再落盘为调度任务。
 • Cron 默认绑定创建它的聊天窗口与当前 OpenCode 会话；如果当前聊天没有绑定会话，将拒绝创建。
 • 其他未知 \`/xxx\` 命令会自动透传给 OpenCode（会话已绑定时生效）。
- • 支持 \`//xxx\` 形式透传命名空间命令（如 \`//superpowers:brainstorming\`）。
+• 支持 \`//xxx\` 形式透传命名空间命令（如 \`//superpowers:brainstorming\`）。
 • 支持透传白名单 shell 命令：\`!cd\`、\`!ls\`、\`!mkdir\`、\`!rm\`、\`!cp\`、\`!mv\`、\`!git\` 等；\`!vi\` / \`!vim\` / \`!nano\` 不会透传。
 • 如果遇到问题，试着使用 \`/panel\` 面板操作更方便。
 
@@ -517,4 +614,6 @@ export function getHelpText(): string {
 • \`/restart opencode\` 重启本地 OpenCode 进程（仅 loopback）
 
 ${cronHelpBlock}`;
+
+  return helpText;
 }

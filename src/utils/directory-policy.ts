@@ -61,7 +61,9 @@ export class DirectoryPolicy {
     const explicitDirectory = options?.explicitDirectory?.trim();
     const aliasName = options?.aliasName?.trim();
     const chatDefaultDirectory = options?.chatDefaultDirectory?.trim();
-    const envDefaultDirectory = options?.envDefaultDirectory ?? directoryConfig.defaultWorkDirectory;
+    const envDefaultDirectory = Object.prototype.hasOwnProperty.call(options ?? {}, 'envDefaultDirectory')
+      ? options?.envDefaultDirectory
+      : directoryConfig.defaultWorkDirectory;
     const serverDefaultDirectory = options?.serverDefaultDirectory?.trim();
     const aliases = options?.projectAliases ?? directoryConfig.projectAliases;
     const allowedDirectories = options?.allowedDirectories ?? directoryConfig.allowedDirectories;
@@ -330,6 +332,14 @@ export class DirectoryPolicy {
       if (typeof directory === 'string' && directory.trim()) {
         pushCandidate(alias, directory, 'alias');
       }
+    }
+
+    if (directoryConfig.defaultWorkDirectory?.trim()) {
+      pushCandidate('默认工作目录', directoryConfig.defaultWorkDirectory, 'env_default');
+    }
+
+    for (const directory of directoryConfig.allowedDirectories) {
+      pushCandidate(path.basename(directory) || directory, directory, 'env_default');
     }
 
     for (const directory of knownDirectories) {
