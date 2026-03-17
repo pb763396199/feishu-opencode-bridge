@@ -10,6 +10,7 @@ import { feishuClient } from '../feishu/client.js';
 import type { FeishuCardActionEvent } from '../feishu/client.js';
 import { p2pHandler } from './p2p.js';
 import { lifecycleHandler } from './lifecycle.js';
+import { taskCommandHandler } from '../commands/task-commands.js';
 
 export class CardActionHandler {
   // 防重复点击：正在处理的 action
@@ -102,6 +103,8 @@ export class CardActionHandler {
       case 'permission_deny':
         // 权限确认，由 index.ts 直接处理
         return;
+      case 'task_do':
+        return this.handleTaskDo(actionValue, event);
       case 'done_confirm':
         return this.handleDoneConfirm(actionValue, event);
       case 'done_cancel':
@@ -230,6 +233,48 @@ export class CardActionHandler {
   private async handleToggleThinking(_value: any, _event: FeishuCardActionEvent): Promise<object> {
       // 兼容历史卡片按钮：思考展开已改为飞书原生折叠面板，无需回调更新。
       return { msg: 'ok' };
+  }
+
+  private async handleTaskDo(value: any, event: FeishuCardActionEvent): Promise<object> {
+    const { chat_id } = value;
+    const senderId = event.openId;
+
+    if (!chat_id || !senderId) {
+      return { toast: { type: 'error', content: '参数错误' } };
+    }
+
+    // 防重复点击
+    const actionKey = `task_do_${chat_id}`;
+    if (this.processingActions.has(actionKey)) {
+      return {
+        toast: { type: 'info', content: '⏳ 正在处理，请稍候...' },
+      };
+    }
+    this.processingActions.add(actionKey);
+    setTimeout(() => this.processingActions.delete(actionKey), 5000);
+
+    try {
+      const result = await taskCommandHandler.handle('do', {
+        chatId: chat_id,
+        messageId: event.messageId ?? '',
+        senderId,
+      });
+
+      return {
+        toast: {
+          type: result.success ? 'success' : 'error',
+          content: result.success ? '🚀 已启动执行' : result.message,
+          i18n_content: {
+            zh_cn: result.success ? '🚀 已启动执行' : result.message,
+            en_us: result.success ? '🚀 Execution started' : result.message,
+          },
+        },
+      };
+    } catch (error) {
+      this.processingActions.delete(actionKey);
+      console.error('[CardAction] handleTaskDo 失败:', error);
+      return { toast: { type: 'error', content: '❌ 操作失败' } };
+    }
   }
 
   // ===== 任务卡片回调处理 =====
@@ -372,7 +417,9 @@ export class CardActionHandler {
       // 立即返回响应（飞书要求 3 秒内响应）
       // 只返回 toast，不返回 card（飞书不支持回调响应中更新卡片，会报 200672）
       // 异步执行取消操作，在群聊中发送确认消息
-      this.doCancelTaskAsync(chat_id, task_id).finally(() => {
+      // 从 action value 获取是否需要 abort（任务在 IN_PROGRESS 时传 true）
+      const abortSession = value.abort_session === true;
+      this.doCancelTaskAsync(chat_id, task_id, abortSession).finally(() => {
         // 3 秒后移除标记
         setTimeout(() => {
           this.processingActions.delete(actionKey);
@@ -517,7 +564,7 @@ export class CardActionHandler {
         elements: [
           {
             tag: 'div',
-            text: { tag: 'lark_md', content: '继续使用 `/close_task` 可以随时解散任务群' }
+            text: { tag: 'lark_md', content: '继续使用 `/close` 可以随时解散任务群' }
           }
         ]
       }
@@ -529,12 +576,17 @@ export class CardActionHandler {
    */
   private async doDoneTaskAsync(chatId: string, taskId: string): Promise<void> {
     try {
+      // 先获取任务标题（用于更新群标题）
+      const task = await taskStore.getTaskByChatId(chatId);
+
       const success = await taskStore.markDone(chatId);
       if (success) {
         console.log(`[CardAction] 任务已完成：${taskId}`);
-        // 注意：不再调用 updateCard，因为飞书在回调响应时已经替换了卡片
-        // 在群聊中发送确认消息
-        await feishuClient.sendText(chatId, '✅ 任务已完成！\n\n使用 `/close_task` 可以解散任务群');
+        // 更新群标题
+        if (task) {
+          await feishuClient.updateChatName(chatId, `🟢 ${task.title}`);
+        }
+        await feishuClient.sendText(chatId, '🎉 任务已完成！\n\n使用 `/close` 可以解散任务群');
       } else {
         console.error(`[CardAction] 完成任务失败：${taskId}`);
         await feishuClient.sendText(chatId, '❌ 完成任务失败，请稍后重试');
@@ -547,15 +599,34 @@ export class CardActionHandler {
 
   /**
    * 异步执行任务取消（避免飞书回调超时）
+   * 若任务正在执行中（IN_PROGRESS），先发 abort 信号给 Opencode
    */
-  private async doCancelTaskAsync(chatId: string, taskId: string): Promise<void> {
+  private async doCancelTaskAsync(chatId: string, taskId: string, abortSession: boolean): Promise<void> {
     try {
+      // 若需要 abort（任务处于 IN_PROGRESS），先发停止信号
+      if (abortSession) {
+        const session = chatSessionStore.getSession(chatId);
+        if (session?.sessionId) {
+          try {
+            await opencodeClient.abortSession(session.sessionId);
+            console.log(`[CardAction] 已发送 abort 给 session: ${session.sessionId}`);
+          } catch (abortErr) {
+            console.warn('[CardAction] abort session 失败（继续执行取消）:', abortErr);
+          }
+        }
+      }
+
+      // 先获取任务标题（用于更新群标题）
+      const task = await taskStore.getTaskByChatId(chatId);
+
       const success = await taskStore.markCancelled(chatId);
       if (success) {
         console.log(`[CardAction] 任务已取消：${taskId}`);
-        // 注意：不再调用 updateCard，因为飞书在回调响应时已经替换了卡片
-        // 在群聊中发送确认消息
-        await feishuClient.sendText(chatId, '✅ 任务已取消\n\n使用 `/close_task` 可以解散任务群');
+        // 更新群标题
+        if (task) {
+          await feishuClient.updateChatName(chatId, `⚫ ${task.title}`);
+        }
+        await feishuClient.sendText(chatId, '🚫 任务已取消\n\n使用 `/close` 可以解散任务群');
       } else {
         console.error(`[CardAction] 取消任务失败：${taskId}`);
         await feishuClient.sendText(chatId, '❌ 取消任务失败，请稍后重试');
@@ -592,7 +663,7 @@ export class CardActionHandler {
       elements: [
         {
           tag: 'div',
-          text: { tag: 'lark_md', content: '任务已标记为完成，可使用 `/close_task` 解散任务群。' }
+          text: { tag: 'lark_md', content: '任务已标记为完成，可使用 `/close` 解散任务群。' }
         }
       ]
     };
@@ -640,7 +711,7 @@ export class CardActionHandler {
       elements: [
         {
           tag: 'div',
-          text: { tag: 'lark_md', content: '任务已取消，可使用 `/close_task` 解散任务群。' }
+          text: { tag: 'lark_md', content: '任务已取消，可使用 `/close` 解散任务群。' }
         }
       ]
     };

@@ -11,8 +11,10 @@
  *
  * 历史：
  *   1 - 初始版本（v2.3，31个任务字段 + 5个项目字段）
+ *   2 - v3.0：删除 INBOX/BACKLOG，新增 IN_REVIEW（错误：状态标签使用英文）
+ *   3 - v3.0修正：状态标签改回中文（待执行/进行中/被阻塞/待验收/已完成/已取消）
  */
-export const BITABLE_SCHEMA_VERSION = '1';
+export const BITABLE_SCHEMA_VERSION = '3';
 
 export const PROJECT_FIELDS = {
   project_id:  '项目ID',
@@ -69,11 +71,10 @@ export const TASK_FIELDS = {
 } as const;
 
 export const TASK_STATUS_LABELS = {
-  INBOX:       '待分类',
-  BACKLOG:     '待规划',
   TODO:        '待执行',
   IN_PROGRESS: '进行中',
   BLOCKED:     '被阻塞',
+  IN_REVIEW:   '待验收',
   DONE:        '已完成',
   CANCELLED:   '已取消',
 } as const;

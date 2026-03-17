@@ -14,6 +14,7 @@ import { opencodeClient } from '../opencode/client.js';
 import { outputBuffer } from '../opencode/output-buffer.js';
 import { feishuClient } from '../feishu/client.js';
 import { groupHandler } from '../handlers/group.js';
+import { taskLifecycleHandler } from '../handlers/task-lifecycle.js';
 
 /**
  * Timeline 回调类型
@@ -207,6 +208,11 @@ export function createPermissionActionCallbacks(
         );
       }
       outputBuffer.touch(bufferKey);
+
+      // 解除任务群 Blocked 状态（权限已处理）
+      taskLifecycleHandler.onBlockedResolved(sessionId).catch(err => {
+        console.error('[ActionHandlers] onBlockedResolved 失败:', err);
+      });
     }
 
     return {
@@ -273,6 +279,12 @@ export function createPermissionActionCallbacks(
     );
 
     outputBuffer.touch(bufferKey);
+
+    // 解除任务群 Blocked 状态（文本方式处理权限）
+    taskLifecycleHandler.onBlockedResolved(pending.sessionId).catch(err => {
+      console.error('[ActionHandlers] onBlockedResolved (text) 失败:', err);
+    });
+
     await feishuClient.reply(
       event.messageId,
       decision.allow ? (decision.remember ? '已允许并记住该权限' : '已允许该权限') : '已拒绝该权限'

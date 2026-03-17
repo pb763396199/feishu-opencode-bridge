@@ -825,7 +825,14 @@ async function main() {
   };
 
   const getPendingQuestionForBuffer = (sessionId: string, chatId: string): StreamCardPendingQuestion | undefined => {
-    const pending = questionHandler.getBySession(sessionId);
+    // 先按主 session 查，查不到再按 conversationKey（chat:chatId）查
+    // 原因：question 可能来自子 session，bufferKey 和 chatId 匹配但 sessionId 是子 session
+    let pending = questionHandler.getBySession(sessionId);
+    if (!pending || pending.chatId !== chatId) {
+      // fallback：按 conversationKey 查（bufferKey = `chat:${chatId}`）
+      const bufferKey = `chat:${chatId}`;
+      pending = questionHandler.getByConversationKey(bufferKey);
+    }
     if (!pending || pending.chatId !== chatId) {
       return undefined;
     }

@@ -24,6 +24,9 @@ export interface QuestionRequest {
     messageID: string;
     callID: string;
   };
+  // 子 session 透传字段（用于关联父 session 的群聊）
+  parentSessionID?: string;
+  relatedSessionID?: string;
 }
 
 // 待回答的问题上下文
