@@ -41,6 +41,49 @@ export interface TaskCommandResult {
   card?: Record<string, unknown>;  // 需要发送的卡片
 }
 
+export interface TaskExecutionDirectoryResolution {
+  directory?: string;
+  source: 'resolvedDirectory' | 'defaultDirectory' | 'task.workspace_path' | 'none';
+}
+
+function redactDirectoryForLog(directory?: string): string {
+  const normalized = directory?.trim();
+  if (!normalized) {
+    return '(none)';
+  }
+
+  const normalizedSegments = normalized.replace(/\\/g, '/').split('/').filter(Boolean);
+  const tail = normalizedSegments[normalizedSegments.length - 1] || normalized;
+
+  if (/^[A-Za-z]:[\\/]*$/.test(normalized)) {
+    return normalized;
+  }
+
+  return `…/${tail}`;
+}
+
+export function resolveTaskExecutionDirectory(
+  task: Pick<Task, 'workspace_path'>,
+  session?: Pick<import('../store/chat-session.js').ChatSessionData, 'resolvedDirectory' | 'defaultDirectory'>
+): TaskExecutionDirectoryResolution {
+  const resolvedDirectory = session?.resolvedDirectory?.trim();
+  if (resolvedDirectory) {
+    return { directory: resolvedDirectory, source: 'resolvedDirectory' };
+  }
+
+  const defaultDirectory = session?.defaultDirectory?.trim();
+  if (defaultDirectory) {
+    return { directory: defaultDirectory, source: 'defaultDirectory' };
+  }
+
+  const taskWorkspacePath = task.workspace_path?.trim();
+  if (taskWorkspacePath) {
+    return { directory: taskWorkspacePath, source: 'task.workspace_path' };
+  }
+
+  return { source: 'none' };
+}
+
 class TaskCommandHandler {
   /**
    * 处理任务命令
@@ -328,11 +371,19 @@ class TaskCommandHandler {
     }
 
     const normalizedExecutionAgent = task.execution_agent.trim();
+    const executionDirectory = resolveTaskExecutionDirectory(task, session);
+
+    console.log(
+      `[TaskCommand] 任务执行目录解析: chat=${chatId}, task=${task.task_id}, session=${session.sessionId}, source=${executionDirectory.source}, directory=${redactDirectoryForLog(executionDirectory.directory)}, taskWorkspace=${redactDirectoryForLog(task.workspace_path)}, resolvedDirectory=${redactDirectoryForLog(session.resolvedDirectory)}, defaultDirectory=${redactDirectoryForLog(session.defaultDirectory)}`
+    );
 
     // 异步发送给 Opencode（不 await，让确认消息先发出）
-    const sendPromise = normalizedExecutionAgent && normalizedExecutionAgent !== 'default'
-      ? opencodeClient.sendMessage(session.sessionId, description, { agent: normalizedExecutionAgent })
-      : opencodeClient.sendMessage(session.sessionId, description);
+    const sendOptions = {
+      ...(normalizedExecutionAgent && normalizedExecutionAgent !== 'default' ? { agent: normalizedExecutionAgent } : {}),
+      ...(executionDirectory.directory ? { directory: executionDirectory.directory } : {}),
+    };
+
+    const sendPromise = opencodeClient.sendMessage(session.sessionId, description, sendOptions);
 
     sendPromise
       .then(() => console.log(`[TaskCommand] /do 已将任务描述发给 OpenCode: session=${session.sessionId}`))
