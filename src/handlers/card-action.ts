@@ -13,6 +13,9 @@ import { lifecycleHandler } from './lifecycle.js';
 import { taskCommandHandler } from '../commands/task-commands.js';
 import { buildCreateTaskCard } from '../feishu/cards.js';
 import { bitableClient } from '../feishu/bitable-client.js';
+import { taskLifecycleHandler } from './task-lifecycle.js';
+
+const SUMMARY_PROMPT = '请用 100-200 字总结本轮工作的交付内容。要求：严谨精炼，只描述实际完成的内容，不包含过程性描述或计划。格式：纯文本，不加标题和列表符号。';
 
 export class CardActionHandler {
   // 防重复点击：正在处理的 action
@@ -590,6 +593,13 @@ export class CardActionHandler {
         if (task) {
           await feishuClient.updateChatName(chatId, `🟢 ${task.title}`);
         }
+        
+        // 触发总结逻辑（仅依赖 sessionId，不依赖 task）
+        const sessionId = chatSessionStore.getSessionId(chatId);
+        if (sessionId) {
+          await this.triggerSummaryForCompletion(sessionId, 'done');
+        }
+        
         await feishuClient.sendText(chatId, '🎉 任务已完成！\n\n使用 `/close` 可以解散任务群');
       } else {
         console.error(`[CardAction] 完成任务失败：${taskId}`);
@@ -602,12 +612,38 @@ export class CardActionHandler {
   }
 
   /**
+   * 触发任务完成/取消时的总结逻辑
+   * @param sessionId - OpenCode Session ID
+   * @param actionType - 'done' | 'cancel'
+   */
+  private async triggerSummaryForCompletion(sessionId: string, actionType: 'done' | 'cancel'): Promise<void> {
+    try {
+      const actionLabel = actionType === 'done' ? '完成' : '取消';
+      console.log(`[CardAction] 触发${actionLabel}总结：session=${sessionId}`);
+      
+      const summaryPrompt = actionType === 'done'
+        ? SUMMARY_PROMPT
+        : '请用 50-100 字总结本轮工作取消的原因和已完成的部分。要求：严谨精炼，不包含过程性描述。格式：纯文本。';
+      
+      taskLifecycleHandler.markSummaryRequested(sessionId);
+      
+      await opencodeClient.sendMessageAsync(sessionId, summaryPrompt);
+      
+      // prompt 发送成功，标记进入收集阶段
+      taskLifecycleHandler.markSummaryCollecting(sessionId);
+      console.log(`[CardAction] ${actionLabel}总结 prompt 已发送：session=${sessionId}`);
+    } catch (err) {
+      console.error(`[CardAction] 发送${actionType === 'done' ? '完成' : '取消'}总结 prompt 失败:`, err);
+      taskLifecycleHandler.clearSummaryState(sessionId);
+    }
+  }
+
+  /**
    * 异步执行任务取消（避免飞书回调超时）
    * 若任务正在执行中（IN_PROGRESS），先发 abort 信号给 Opencode
    */
   private async doCancelTaskAsync(chatId: string, taskId: string, abortSession: boolean): Promise<void> {
     try {
-      // 若需要 abort（任务处于 IN_PROGRESS），先发停止信号
       if (abortSession) {
         const session = chatSessionStore.getSession(chatId);
         if (session?.sessionId) {
@@ -620,16 +656,21 @@ export class CardActionHandler {
         }
       }
 
-      // 先获取任务标题（用于更新群标题）
       const task = await taskStore.getTaskByChatId(chatId);
 
       const success = await taskStore.markCancelled(chatId);
       if (success) {
         console.log(`[CardAction] 任务已取消：${taskId}`);
-        // 更新群标题
         if (task) {
           await feishuClient.updateChatName(chatId, `⚫ ${task.title}`);
         }
+        
+        // 触发总结逻辑（仅依赖 sessionId）
+        const sessionId = chatSessionStore.getSessionId(chatId);
+        if (sessionId) {
+          await this.triggerSummaryForCompletion(sessionId, 'cancel');
+        }
+        
         await feishuClient.sendText(chatId, '🚫 任务已取消\n\n使用 `/close` 可以解散任务群');
       } else {
         console.error(`[CardAction] 取消任务失败：${taskId}`);
